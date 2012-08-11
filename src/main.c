@@ -108,6 +108,9 @@ find(sqlite3 *db, char *path)
 
 		MHASH td;
 		unsigned char hash[20], chash[41] = {0};
+		char **table;
+		char *errmsg;
+		int nrows, ncols;
 
 		if (!strcmp(strrchr(fname, '.'), ".zip")) {
 			struct zip *zarc = zip_open(fname, 0, NULL);
@@ -124,6 +127,17 @@ find(sqlite3 *db, char *path)
 				}
 				zip_fclose(zfile);
 				fprintf(stdout, "ZFile: %s/%s\t%d\t%.8x\n", fname, zip_get_name(zarc, i, 0), zsb.size, zsb.crc);
+				char *query = sqlite3_mprintf("SELECT count(id) FROM files WHERE size=%d AND crc LIKE '%x'", zsb.size, zsb.crc);
+				if (sqlite3_get_table(db, query, &table, &nrows, &ncols, &errmsg) != SQLITE_OK) {
+					fprintf(stderr, "SQL error: %s\n", errmsg);
+					sqlite3_free(errmsg);
+					sqlite3_free(query);
+					sqlite3_close(db);
+					return EXIT_FAILURE;
+				}
+				fprintf(stdout, "\tcount = %s\n", table[1]);
+				sqlite3_free_table(table);
+				sqlite3_free(query);
 			}
 			zip_close(zarc);
 		} else {
@@ -144,20 +158,17 @@ find(sqlite3 *db, char *path)
 			fprintf(stdout, "File: %s\t%d\t", fname, sb.st_size);
 			fprintf(stdout, "%x\n", ihash);
 
-char **table;
-char *errmsg;
-int nrows, ncols;
-char *query = sqlite3_mprintf("SELECT count(id) FROM files WHERE size=%d AND crc LIKE '%x'", sb.st_size, ihash);
-if (sqlite3_get_table(db, query, &table, &nrows, &ncols, &errmsg) != SQLITE_OK) {
-	fprintf(stderr, "SQL error: %s\n", errmsg); \
-	sqlite3_free(errmsg); \
-	sqlite3_free(query); \
-	sqlite3_close(db); \
-	return EXIT_FAILURE; \
-}
-fprintf(stdout, "\tcount = %s\n", table[1]);
-sqlite3_free_table(table);
-sqlite3_free(query);
+			char *query = sqlite3_mprintf("SELECT count(id) FROM files WHERE size=%d AND crc LIKE '%x'", sb.st_size, ihash);
+			if (sqlite3_get_table(db, query, &table, &nrows, &ncols, &errmsg) != SQLITE_OK) {
+				fprintf(stderr, "SQL error: %s\n", errmsg);
+				sqlite3_free(errmsg);
+				sqlite3_free(query);
+				sqlite3_close(db);
+				return EXIT_FAILURE;
+			}
+			fprintf(stdout, "\tcount = %s\n", table[1]);
+			sqlite3_free_table(table);
+			sqlite3_free(query);
 		}
 
 		free(fname);
