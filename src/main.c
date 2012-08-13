@@ -12,6 +12,7 @@
 #include <mhash.h>
 #include <sqlite3.h>
 #include <zip.h>
+#include <zzip.h>
 
 #define COLLECTION 1
 #define SET 2
@@ -20,11 +21,12 @@
 
 #define CREATE_COLLECTIONS \
 "CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY AUTOINCREMENT," \
-				    "name VARCHAR," \
-				    "description VARCHAR," \
-				    "version VARCHAR," \
-				    "comment VARCHAR," \
-				    "header VARCHAR)"
+					"name VARCHAR," \
+					"root VARCHAR," \
+					"description VARCHAR," \
+					"version VARCHAR," \
+					"comment VARCHAR," \
+					"header VARCHAR)"
 #define CREATE_SETS \
 "CREATE TABLE IF NOT EXISTS sets (id INTEGER PRIMARY KEY AUTOINCREMENT," \
 				 "collection_id INTEGER," \
@@ -32,14 +34,14 @@
 				 "description VARCHAR)"
 #define CREATE_FILES \
 "CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY AUTOINCREMENT," \
-				 "set_id INTEGER," \
-				 "name VARCHAR," \
-				 "size INTEGER," \
-				 "flags VARCHAR," \
-				 "crc INTEGER," \
-				 "md5 CHARACTER(32)," \
-				 "sha1 CHARACTER(40)," \
-				 "comment VARCHAR)"
+				  "set_id INTEGER," \
+				  "name VARCHAR," \
+				  "size INTEGER," \
+				  "flags VARCHAR," \
+				  "crc INTEGER," \
+				  "md5 CHARACTER(32)," \
+				  "sha1 CHARACTER(40)," \
+				  "comment VARCHAR)"
 
 #define SQL_INSERT(db, ...) { \
 	char *query = sqlite3_mprintf(__VA_ARGS__); \
@@ -69,14 +71,18 @@ strappend(char **str, char *frag)
 int
 find(sqlite3 *db, char *path)
 {
-	DIR		*dir;
+	ZZIP_DIR	*dir;
 	struct dirent	*ent;
 	struct stat	sb;
 	int		pathlen = strlen(path);
 	int		i, j;
 
+	struct zip *zarc;
 	if ((dir = opendir(path)) == NULL) {
-		return EXIT_FAILURE;
+		char *zbuf = sqlite3_mprintf("%s.zip", path);
+		if ((zarc = zip_open(zbuf, 0, NULL)) == NULL) {
+			return EXIT_FAILURE;
+		}
 	}
 	while ((ent = readdir(dir)) != NULL) {
 		if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
@@ -180,7 +186,7 @@ find(sqlite3 *db, char *path)
 
 // Still needs optimization & error handling.
 int
-load_csv(char *in_file, sqlite3 *db)
+load_csv(char *in_file, char *root, sqlite3 *db)
 {
 	FILE	*input;
 	char	*errmsg = NULL;
@@ -196,7 +202,7 @@ load_csv(char *in_file, sqlite3 *db)
 	if (dot) {
 		*dot = '\0';
 	}
-	SQL_INSERT(db, "INSERT INTO collections (name) VALUES (%Q)", in_file);
+	SQL_INSERT(db, "INSERT INTO collections (name, root) VALUES (%Q, %Q)", in_file, root);
 	collection_id = sqlite3_last_insert_rowid(db);
 
 	char line[2048];
@@ -236,7 +242,7 @@ load_csv(char *in_file, sqlite3 *db)
 // Still needs header handling, other fields.
 // Also optimization & error handling.
 int
-load_cmpro_dat(char *in_file, sqlite3 *db)
+load_cmpro_dat(char *in_file, char *root, sqlite3 *db)
 {
 	FILE	*input;
 	char	*errmsg = NULL;
@@ -288,7 +294,7 @@ load_cmpro_dat(char *in_file, sqlite3 *db)
 			}
 		}
 		if (table == COLLECTION) {
-			SQL_INSERT(db, "INSERT INTO collections (%s) VALUES (%s)", tags, values);
+			SQL_INSERT(db, "INSERT INTO collections (%s, root) VALUES (%s, %Q)", tags, values, root);
 			collection_id = sqlite3_last_insert_rowid(db);
 		} else {
 			SQL_INSERT(db, "INSERT INTO sets (collection_id, %s) VALUES (%d, %s)", tags, collection_id, values);
@@ -313,11 +319,12 @@ main(int argc, char **argv)
 	char	*errmsg = NULL;
 	char	*dbname = NULL;
 	char	*crcname = NULL;
+	char	*root = NULL;
 	char	opt;
 	int	dat_flag = 0;
 	FILE *in;
 
-	while ((opt = getopt(argc, argv, "c:d:m:")) != -1) {
+	while ((opt = getopt(argc, argv, "c:d:m:r:")) != -1) {
 		switch (opt) {
 		case 'c':
 			dat_flag = CSV;
@@ -329,6 +336,9 @@ main(int argc, char **argv)
 		case 'm':
 			dat_flag = CMPRO;
 			crcname = optarg;
+			break;
+		case 'r':
+			root = optarg;
 			break;
 		}
 	}
@@ -369,14 +379,38 @@ main(int argc, char **argv)
 	}
 
 	if (dat_flag == CSV) {
-		if (load_csv(crcname, db) == EXIT_FAILURE)
+		if (load_csv(crcname, root, db) == EXIT_FAILURE)
 			return EXIT_FAILURE;
 	} else if (dat_flag == CMPRO) {
-		if (load_cmpro_dat(crcname, db) == EXIT_FAILURE)
+		if (load_cmpro_dat(crcname, root, db) == EXIT_FAILURE)
 			return EXIT_FAILURE;
 	}
 
-	return find(db, ".");
+	if (argv[optind] && !strcmp(argv[optind], "search")) {
+		return find(db, ".");
+	} else if (argv[optind] && !strcmp(argv[optind], "verify")) {
+		char *query = sqlite3_mprintf("SELECT name, root FROM collections");
+		char **table, *errmsg;
+		int nrows, ncols, i;
+		if (sqlite3_get_table(db, query, &table, &nrows, &ncols, &errmsg) != SQLITE_OK) {
+			fprintf(stderr, "SQL error: %s\n", errmsg);
+			sqlite3_free(errmsg);
+			sqlite3_free(query);
+			sqlite3_close(db);
+			return EXIT_FAILURE;
+		}
+		for (i = ncols; i < ((nrows+1)*ncols); i+=ncols) {
+			char *dir = sqlite3_mprintf("%s/%s", table[i+1], table[i]);
+			find(db, dir);
+			sqlite3_free(dir);
+		}
+		sqlite3_free_table(table);
+		sqlite3_free(query);
+	} else {
+		fprintf(stderr, "Unknown command %s.\n"
+			"search - search local tree for files in db.\n"
+			"verify - verify files in collection directories.\n", argv[optind]);
+	}
 
 //Should call sqlite3_close(db) somewhere
 }
