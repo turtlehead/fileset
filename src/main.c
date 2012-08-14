@@ -37,7 +37,7 @@
 				  "name VARCHAR," \
 				  "size INTEGER," \
 				  "flags VARCHAR," \
-				  "crc INTEGER," \
+				  "crc UNSIGNED INTEGER," \
 				  "md5 CHARACTER(32)," \
 				  "sha1 CHARACTER(40)," \
 				  "comment VARCHAR)"
@@ -83,13 +83,38 @@ open_zip(char *path)
 }
 
 int
-verify_file(sqlite3 *db, char *path, struct stat sb)
+find_by_crc(sqlite3 *db, off_t size, unsigned int crc)
 {
-	MHASH td;
-	unsigned char hash[20], chash[41] = {0};
 	char **table;
 	char *errmsg;
 	int nrows, ncols;
+	int id = -1;
+
+	char *query = sqlite3_mprintf("SELECT id FROM files WHERE size=%d AND crc=%u", size, crc);
+	if (sqlite3_get_table(db, query, &table, &nrows, &ncols, &errmsg) != SQLITE_OK) {
+		fprintf(stderr, "SQL error: %s\n", errmsg);
+		sqlite3_free(errmsg);
+		sqlite3_free(query);
+		sqlite3_close(db);
+		return -1;
+	}
+fprintf(stderr, "nrows == %d\n", nrows);
+	if (nrows == 1) {
+		sscanf(table[1], "%d", &id);
+	} else if (nrows > 1) {
+		fprintf(stderr, "Error: multiple size/crc matches\n");
+	}
+	sqlite3_free_table(table);
+	sqlite3_free(query);
+
+	return id;
+}
+
+int
+verify_file(sqlite3 *db, char *path, struct stat sb)
+{
+	MHASH td;
+	unsigned char hash[20];
 
 	int in;
 
@@ -106,19 +131,32 @@ verify_file(sqlite3 *db, char *path, struct stat sb)
 	unsigned int ihash = (hash[3] << 24) + (hash[2] << 16) + (hash[1] << 8) + hash[0];
 
 	fprintf(stdout, "File: %s\t%d\t", path, sb.st_size);
-	fprintf(stdout, "%x\n", ihash);
+	fprintf(stdout, "%x [%d]\n", ihash, find_by_crc(db, sb.st_size, ihash));
 
-	char *query = sqlite3_mprintf("SELECT count(id) FROM files WHERE size=%d AND crc LIKE '%x'", sb.st_size, ihash);
-	if (sqlite3_get_table(db, query, &table, &nrows, &ncols, &errmsg) != SQLITE_OK) {
-		fprintf(stderr, "SQL error: %s\n", errmsg);
-		sqlite3_free(errmsg);
-		sqlite3_free(query);
-		sqlite3_close(db);
-		return EXIT_FAILURE;
+	return EXIT_SUCCESS;
+}
+
+int
+verify_zip(sqlite3 *db, char *path, struct zip *ziparc)
+{
+	int i;
+
+	for (i = 0; i < zip_get_num_files(ziparc); i++) {
+		char **table;
+		char *errmsg;
+		int nrows, ncols;
+		int len;
+		struct zip_file *zfile = zip_fopen_index(ziparc,i, 0);
+		struct zip_stat zsb;
+		zip_stat_index(ziparc, i, 0, &zsb);
+		if (zsb.size == 0 && zsb.crc == 0 
+		    && zsb.name[strlen(zsb.name)-1] == '/') {
+			zip_fclose(zfile);
+			continue;
+		}
+		zip_fclose(zfile);
+		fprintf(stdout, "ZFile: %s/%s\t%d\t%.8x [%d]\n", path, zip_get_name(ziparc, i, 0), zsb.size, zsb.crc, find_by_crc(db, zsb.size, zsb.crc));
 	}
-	fprintf(stdout, "\tcount = %s\n", table[1]);
-	sqlite3_free_table(table);
-	sqlite3_free(query);
 
 	return EXIT_SUCCESS;
 }
@@ -160,39 +198,16 @@ find(sqlite3 *db, char *path)
 				} else {
 					fname = realname;
 				}
+			} else if ((ziparc = open_zip(fname)) != NULL) {
+				verify_zip(db, fname, ziparc);
+			} else {
+				verify_file(db, fname, sb);
 			}
-			verify_file(db, fname, sb);
 			free(fname);
 		}
 		closedir(dir);
 	} else if ((ziparc = open_zip(path)) != NULL) {
-		for (i = 0; i < zip_get_num_files(ziparc); i++) {
-			char **table;
-			char *errmsg;
-			int nrows, ncols;
-			int len;
-			struct zip_file *zfile = zip_fopen_index(ziparc,i, 0);
-			struct zip_stat zsb;
-			zip_stat_index(ziparc, i, 0, &zsb);
-			if (zsb.size == 0 && zsb.crc == 0 
-			    && zsb.name[strlen(zsb.name)-1] == '/') {
-				zip_fclose(zfile);
-				continue;
-			}
-			zip_fclose(zfile);
-			fprintf(stdout, "ZFile: %s/%s\t%d\t%.8x\n", path, zip_get_name(ziparc, i, 0), zsb.size, zsb.crc);
-			char *query = sqlite3_mprintf("SELECT count(id) FROM files WHERE size=%d AND crc LIKE '%x'", zsb.size, zsb.crc);
-			if (sqlite3_get_table(db, query, &table, &nrows, &ncols, &errmsg) != SQLITE_OK) {
-				fprintf(stderr, "SQL error: %s\n", errmsg);
-				sqlite3_free(errmsg);
-				sqlite3_free(query);
-				sqlite3_close(db);
-				return EXIT_FAILURE;
-			}
-			fprintf(stdout, "\tcount = %s\n", table[1]);
-			sqlite3_free_table(table);
-			sqlite3_free(query);
-		}
+		verify_zip(db, path, ziparc);
 		zip_close(ziparc);
 	} else {
 		stat(path, &sb);
@@ -220,7 +235,7 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 	if (dot) {
 		*dot = '\0';
 	}
-	SQL_INSERT(db, "INSERT INTO collections (name, root) VALUES (%Q, %Q)", in_file, root);
+	SQL_INSERT(db, "INSERT INTO collections (name, root) VALUES (%Q, %Q)", strrchr(in_file, '/')+1, root);
 	collection_id = sqlite3_last_insert_rowid(db);
 
 	char line[2048];
@@ -233,7 +248,13 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 		char *name = strtok(line, "\"");
 		strappend(&values, name);
 		while ((tok = strtok(NULL, ",\r\n")) != NULL) {
-			if (vcount == 2) {
+			if (vcount == 1) {
+				char decbuf[32];
+				unsigned int hexbuf;
+				sscanf(tok, "%x", &hexbuf);
+				sprintf(decbuf, "%u", hexbuf);
+				strappend(&values, decbuf);
+			} else if (vcount == 2) {
 				if (!set_name || strcmp(set_name, tok)) {
 					free(set_name);
 					set_name = strdup(tok);
@@ -293,12 +314,17 @@ load_cmpro_dat(char *in_file, char *root, sqlite3 *db)
 					if (!strcmp(rtag, "(") || !strncmp(rtag, ")", 1)) {
 						continue;
 					} else if (!strcmp(rtag, "name")) {
-						strappend(&rtags, rtag);
 						strappend(&rvalues, strtok(NULL, "\""));
+					} else if (!strcmp(rtag, "crc")) {
+						char decbuf[32];
+						unsigned int hexbuf;
+						sscanf(strtok(NULL, " \""), "%x", &hexbuf);
+						sprintf(decbuf, "%u", hexbuf);
+						strappend(&rvalues, decbuf);
 					} else {
-						strappend(&rtags, rtag);
 						strappend(&rvalues, strtok(NULL, " \""));
 					}
+					strappend(&rtags, rtag);
 				}
 
 				SQL_INSERT(db, "INSERT INTO files (%s) VALUES (%s)", rtags, rvalues);
