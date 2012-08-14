@@ -12,7 +12,6 @@
 #include <mhash.h>
 #include <sqlite3.h>
 #include <zip.h>
-#include <zzip.h>
 
 #define COLLECTION 1
 #define SET 2
@@ -68,103 +67,121 @@ strappend(char **str, char *frag)
 	return *str;
 }
 
+struct zip *
+open_zip(char *path)
+{
+	struct zip	*arc = NULL;
+	int		error;
+
+	if ((arc = zip_open(path, 0, &error)) == NULL) {
+		char *zpath = sqlite3_mprintf("%s.zip", path);
+		arc = zip_open(zpath, 0, &error);
+		sqlite3_free(zpath);
+	}
+
+	return arc;
+}
+
+int
+verify_file(sqlite3 *db, char *path, struct stat sb)
+{
+	MHASH td;
+	unsigned char hash[20], chash[41] = {0};
+	char **table;
+	char *errmsg;
+	int nrows, ncols;
+
+	int in;
+
+	if ((in = open(path, O_RDONLY, 0)) == -1) {
+		return EXIT_FAILURE;
+	}
+	if ((td = mhash_init(MHASH_CRC32B)) == MHASH_FAILED) {
+		return EXIT_FAILURE;
+	}
+	unsigned char *buffer;
+	buffer = mmap(NULL, sb.st_size, PROT_READ, MAP_SHARED, in, 0);
+	mhash(td, buffer, sb.st_size);
+	mhash_deinit(td, hash);
+	unsigned int ihash = (hash[3] << 24) + (hash[2] << 16) + (hash[1] << 8) + hash[0];
+
+	fprintf(stdout, "File: %s\t%d\t", path, sb.st_size);
+	fprintf(stdout, "%x\n", ihash);
+
+	char *query = sqlite3_mprintf("SELECT count(id) FROM files WHERE size=%d AND crc LIKE '%x'", sb.st_size, ihash);
+	if (sqlite3_get_table(db, query, &table, &nrows, &ncols, &errmsg) != SQLITE_OK) {
+		fprintf(stderr, "SQL error: %s\n", errmsg);
+		sqlite3_free(errmsg);
+		sqlite3_free(query);
+		sqlite3_close(db);
+		return EXIT_FAILURE;
+	}
+	fprintf(stdout, "\tcount = %s\n", table[1]);
+	sqlite3_free_table(table);
+	sqlite3_free(query);
+
+	return EXIT_SUCCESS;
+}
+
 int
 find(sqlite3 *db, char *path)
 {
-	ZZIP_DIR	*dir;
+	DIR		*dir;
 	struct dirent	*ent;
 	struct stat	sb;
+	struct zip	*ziparc;
 	int		pathlen = strlen(path);
 	int		i, j;
 
-	struct zip *zarc;
-	if ((dir = opendir(path)) == NULL) {
-		char *zbuf = sqlite3_mprintf("%s.zip", path);
-		if ((zarc = zip_open(zbuf, 0, NULL)) == NULL) {
-			return EXIT_FAILURE;
-		}
-	}
-	while ((ent = readdir(dir)) != NULL) {
-		if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
-			continue;
-		}
-		char *fname = (char *)calloc(pathlen + strlen(ent->d_name) +
-					     2, sizeof(char));
-		strcat(strcat(strcpy(fname, path), "/"), ent->d_name);
-		stat(fname, &sb);
-		if (S_ISDIR(sb.st_mode)) {
-			find(db, fname);
-			free(fname);
-			continue;
-		} else if (S_ISLNK(sb.st_mode)) {
-			char		*realname = realpath(fname, NULL);
-			DIR		*ldir;
-			struct stat	lsb;
-
-			free(fname);
-			if (stat(realname, &lsb) == 0 
-			    && S_ISDIR(lsb.st_mode)) {
-				find(db, realname);
-				free(realname);
+	if ((dir = opendir(path)) != NULL) {
+		while ((ent = readdir(dir)) != NULL) {
+			if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
 				continue;
-			} else {
-				fname = realname;
 			}
-		}
+			char *fname = (char *)calloc(pathlen + strlen(ent->d_name) +
+						     2, sizeof(char));
+			strcat(strcat(strcpy(fname, path), "/"), ent->d_name);
+			stat(fname, &sb);
+			if (S_ISDIR(sb.st_mode)) {
+				find(db, fname);
+				free(fname);
+				continue;
+			} else if (S_ISLNK(sb.st_mode)) {
+				char		*realname = realpath(fname, NULL);
+				DIR		*ldir;
+				struct stat	lsb;
 
-		MHASH td;
-		unsigned char hash[20], chash[41] = {0};
-		char **table;
-		char *errmsg;
-		int nrows, ncols;
-
-		if (!strcmp(strrchr(fname, '.'), ".zip")) {
-			struct zip *zarc = zip_open(fname, 0, NULL);
-			unsigned char buffer[1024];
-			for (i = 0; i < zip_get_num_files(zarc); i++) {
-				int len;
-				struct zip_file *zfile = zip_fopen_index(zarc,i, 0);
-				struct zip_stat zsb;
-				zip_stat_index(zarc, i, 0, &zsb);
-				if (zsb.size == 0 && zsb.crc == 0 
-				    && zsb.name[strlen(zsb.name)-1] == '/') {
-					zip_fclose(zfile);
+				free(fname);
+				if (stat(realname, &lsb) == 0 
+				    && S_ISDIR(lsb.st_mode)) {
+					find(db, realname);
+					free(realname);
 					continue;
+				} else {
+					fname = realname;
 				}
+			}
+			verify_file(db, fname, sb);
+			free(fname);
+		}
+		closedir(dir);
+	} else if ((ziparc = open_zip(path)) != NULL) {
+		for (i = 0; i < zip_get_num_files(ziparc); i++) {
+			char **table;
+			char *errmsg;
+			int nrows, ncols;
+			int len;
+			struct zip_file *zfile = zip_fopen_index(ziparc,i, 0);
+			struct zip_stat zsb;
+			zip_stat_index(ziparc, i, 0, &zsb);
+			if (zsb.size == 0 && zsb.crc == 0 
+			    && zsb.name[strlen(zsb.name)-1] == '/') {
 				zip_fclose(zfile);
-				fprintf(stdout, "ZFile: %s/%s\t%d\t%.8x\n", fname, zip_get_name(zarc, i, 0), zsb.size, zsb.crc);
-				char *query = sqlite3_mprintf("SELECT count(id) FROM files WHERE size=%d AND crc LIKE '%x'", zsb.size, zsb.crc);
-				if (sqlite3_get_table(db, query, &table, &nrows, &ncols, &errmsg) != SQLITE_OK) {
-					fprintf(stderr, "SQL error: %s\n", errmsg);
-					sqlite3_free(errmsg);
-					sqlite3_free(query);
-					sqlite3_close(db);
-					return EXIT_FAILURE;
-				}
-				fprintf(stdout, "\tcount = %s\n", table[1]);
-				sqlite3_free_table(table);
-				sqlite3_free(query);
+				continue;
 			}
-			zip_close(zarc);
-		} else {
-			int in;
-
-			if ((in = open(fname, O_RDONLY, 0)) == -1) {
-				return EXIT_FAILURE;
-			}
-			if ((td = mhash_init(MHASH_CRC32B)) == MHASH_FAILED) {
-				return EXIT_FAILURE;
-			}
-			unsigned char *buffer;
-			buffer = mmap(NULL, sb.st_size, PROT_READ, MAP_SHARED, in, 0);
-			mhash(td, buffer, sb.st_size);
-			mhash_deinit(td, hash);
-			unsigned int ihash = (hash[3] << 24) + (hash[2] << 16) + (hash[1] << 8) + hash[0];
-
-			fprintf(stdout, "File: %s\t%d\t", fname, sb.st_size);
-			fprintf(stdout, "%x\n", ihash);
-
-			char *query = sqlite3_mprintf("SELECT count(id) FROM files WHERE size=%d AND crc LIKE '%x'", sb.st_size, ihash);
+			zip_fclose(zfile);
+			fprintf(stdout, "ZFile: %s/%s\t%d\t%.8x\n", path, zip_get_name(ziparc, i, 0), zsb.size, zsb.crc);
+			char *query = sqlite3_mprintf("SELECT count(id) FROM files WHERE size=%d AND crc LIKE '%x'", zsb.size, zsb.crc);
 			if (sqlite3_get_table(db, query, &table, &nrows, &ncols, &errmsg) != SQLITE_OK) {
 				fprintf(stderr, "SQL error: %s\n", errmsg);
 				sqlite3_free(errmsg);
@@ -176,10 +193,11 @@ find(sqlite3 *db, char *path)
 			sqlite3_free_table(table);
 			sqlite3_free(query);
 		}
-
-		free(fname);
+		zip_close(ziparc);
+	} else {
+		stat(path, &sb);
+		verify_file(db, path, sb);
 	}
-	closedir(dir);
 
 	return EXIT_SUCCESS;
 }
