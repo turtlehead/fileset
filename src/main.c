@@ -397,44 +397,44 @@ main(int argc, char **argv)
 		}
 	}
 
-	if (setup_flag) {
-		if (dbname == NULL) {
-			char *home;
-			if ((home = getenv("HOME")) == NULL) {
-				struct passwd *pw = getpwuid(getuid());
-				home = strdup(pw->pw_dir);
-			}
-			dbname = (char *)calloc(strlen(home)+1+11+1, sizeof(char));
-			sprintf(dbname, "%s/.fileset.db", home);
+	if (dbname == NULL) {
+		char *home;
+		if ((home = getenv("HOME")) == NULL) {
+			struct passwd *pw = getpwuid(getuid());
+			home = strdup(pw->pw_dir);
 		}
+		dbname = (char *)calloc(strlen(home)+1+11+1, sizeof(char));
+		sprintf(dbname, "%s/.fileset.db", home);
+	}
+	if (setup_flag) {
 		if (unlink(dbname) && errno != ENOENT) {
 			perror("clearing old database failed");
 			return EXIT_FAILURE;
 		}
-		if (sqlite3_open(dbname, &db)) {
-			fprintf(stderr, "couldn't open database: %s\n", sqlite3_errmsg(db));
-			sqlite3_close(db);
-			return EXIT_FAILURE;
-		}
+	}
+	if (sqlite3_open(dbname, &db)) {
+		fprintf(stderr, "couldn't open database: %s\n", sqlite3_errmsg(db));
+		sqlite3_close(db);
+		return EXIT_FAILURE;
+	}
 
-		if (sqlite3_exec(db, CREATE_COLLECTIONS, NULL, 0, &errmsg) != SQLITE_OK) {
-			fprintf(stderr, "SQL error: %s\n", errmsg);
-			sqlite3_free(errmsg);
-			sqlite3_close(db);
-			return EXIT_FAILURE;
-		}
-		if (sqlite3_exec(db, CREATE_SETS, NULL, 0, &errmsg) != SQLITE_OK) {
-			fprintf(stderr, "SQL error: %s\n", errmsg);
-			sqlite3_free(errmsg);
-			sqlite3_close(db);
-			return EXIT_FAILURE;
-		}
-		if (sqlite3_exec(db, CREATE_FILES, NULL, 0, &errmsg) != SQLITE_OK) {
-			fprintf(stderr, "SQL error: %s\n", errmsg);
-			sqlite3_free(errmsg);
-			sqlite3_close(db);
-			return EXIT_FAILURE;
-		}
+	if (sqlite3_exec(db, CREATE_COLLECTIONS, NULL, 0, &errmsg) != SQLITE_OK) {
+		fprintf(stderr, "SQL error: %s\n", errmsg);
+		sqlite3_free(errmsg);
+		sqlite3_close(db);
+		return EXIT_FAILURE;
+	}
+	if (sqlite3_exec(db, CREATE_SETS, NULL, 0, &errmsg) != SQLITE_OK) {
+		fprintf(stderr, "SQL error: %s\n", errmsg);
+		sqlite3_free(errmsg);
+		sqlite3_close(db);
+		return EXIT_FAILURE;
+	}
+	if (sqlite3_exec(db, CREATE_FILES, NULL, 0, &errmsg) != SQLITE_OK) {
+		fprintf(stderr, "SQL error: %s\n", errmsg);
+		sqlite3_free(errmsg);
+		sqlite3_close(db);
+		return EXIT_FAILURE;
 	}
 
 	if (dat_flag == CSV) {
