@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pwd.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/types.h>
@@ -132,8 +133,7 @@ verify_file(sqlite3 *db, char *path, struct stat sb)
 	close(in);
 	unsigned int ihash = (hash[3] << 24) + (hash[2] << 16) + (hash[1] << 8) + hash[0];
 
-	fprintf(stdout, "File: %s\t%d\t", path, sb.st_size);
-	fprintf(stdout, "%x [%d]\n", ihash, find_by_crc(db, sb.st_size, ihash));
+	fprintf(stdout, "File: %s\t%s\n", path, find_by_crc(db, sb.st_size, ihash)>0?"Found":"Unknown");
 
 	return EXIT_SUCCESS;
 }
@@ -157,7 +157,7 @@ verify_zip(sqlite3 *db, char *path, struct zip *ziparc)
 			continue;
 		}
 		zip_fclose(zfile);
-		fprintf(stdout, "ZFile: %s/%s\t%d\t%.8x [%d]\n", path, zip_get_name(ziparc, i, 0), zsb.size, zsb.crc, find_by_crc(db, zsb.size, zsb.crc));
+		fprintf(stdout, "ZFile: %s/%s\t%s\n", path, zip_get_name(ziparc, i, 0), find_by_crc(db, zsb.size, zsb.crc)>0?"Found":"Unknown");
 	}
 
 	return EXIT_SUCCESS;
@@ -368,9 +368,11 @@ main(int argc, char **argv)
 	char	*root = NULL;
 	char	opt;
 	int	dat_flag = 0;
+	int	zip_flag = 0;
+	int	setup_flag = 0;
 	FILE *in;
 
-	while ((opt = getopt(argc, argv, "c:d:m:r:")) != -1) {
+	while ((opt = getopt(argc, argv, "c:d:m:r:sz")) != -1) {
 		switch (opt) {
 		case 'c':
 			dat_flag = CSV;
@@ -386,42 +388,53 @@ main(int argc, char **argv)
 		case 'r':
 			root = optarg;
 			break;
+		case 's':
+			setup_flag = 1;
+			break;
+		case 'z':
+			zip_flag = 1;
+			break;
 		}
 	}
 
-	if (dbname == NULL) {
-		char *home;
-		if ((home = getenv("HOME")) == NULL) {
-			struct passwd *pw = getpwuid(getuid());
-			home = strdup(pw->pw_dir);
+	if (setup_flag) {
+		if (dbname == NULL) {
+			char *home;
+			if ((home = getenv("HOME")) == NULL) {
+				struct passwd *pw = getpwuid(getuid());
+				home = strdup(pw->pw_dir);
+			}
+			dbname = (char *)calloc(strlen(home)+1+11+1, sizeof(char));
+			sprintf(dbname, "%s/.fileset.db", home);
 		}
-		dbname = (char *)calloc(strlen(home)+1+11+1, sizeof(char));
-		sprintf(dbname, "%s/.fileset.db", home);
-	}
+		if (unlink(dbname) && errno != ENOENT) {
+			perror("clearing old database failed");
+			return EXIT_FAILURE;
+		}
+		if (sqlite3_open(dbname, &db)) {
+			fprintf(stderr, "couldn't open database: %s\n", sqlite3_errmsg(db));
+			sqlite3_close(db);
+			return EXIT_FAILURE;
+		}
 
-	if (sqlite3_open(dbname, &db)) {
-		fprintf(stderr, "couldn't open database: %s\n", sqlite3_errmsg(db));
-		sqlite3_close(db);
-		return EXIT_FAILURE;
-	}
-
-	if (sqlite3_exec(db, CREATE_COLLECTIONS, NULL, 0, &errmsg) != SQLITE_OK) {
-		fprintf(stderr, "SQL error: %s\n", errmsg);
-		sqlite3_free(errmsg);
-		sqlite3_close(db);
-		return EXIT_FAILURE;
-	}
-	if (sqlite3_exec(db, CREATE_SETS, NULL, 0, &errmsg) != SQLITE_OK) {
-		fprintf(stderr, "SQL error: %s\n", errmsg);
-		sqlite3_free(errmsg);
-		sqlite3_close(db);
-		return EXIT_FAILURE;
-	}
-	if (sqlite3_exec(db, CREATE_FILES, NULL, 0, &errmsg) != SQLITE_OK) {
-		fprintf(stderr, "SQL error: %s\n", errmsg);
-		sqlite3_free(errmsg);
-		sqlite3_close(db);
-		return EXIT_FAILURE;
+		if (sqlite3_exec(db, CREATE_COLLECTIONS, NULL, 0, &errmsg) != SQLITE_OK) {
+			fprintf(stderr, "SQL error: %s\n", errmsg);
+			sqlite3_free(errmsg);
+			sqlite3_close(db);
+			return EXIT_FAILURE;
+		}
+		if (sqlite3_exec(db, CREATE_SETS, NULL, 0, &errmsg) != SQLITE_OK) {
+			fprintf(stderr, "SQL error: %s\n", errmsg);
+			sqlite3_free(errmsg);
+			sqlite3_close(db);
+			return EXIT_FAILURE;
+		}
+		if (sqlite3_exec(db, CREATE_FILES, NULL, 0, &errmsg) != SQLITE_OK) {
+			fprintf(stderr, "SQL error: %s\n", errmsg);
+			sqlite3_free(errmsg);
+			sqlite3_close(db);
+			return EXIT_FAILURE;
+		}
 	}
 
 	if (dat_flag == CSV) {
@@ -432,9 +445,11 @@ main(int argc, char **argv)
 			return EXIT_FAILURE;
 	}
 
-	if (argv[optind] && !strcmp(argv[optind], "search")) {
+	if (!argv[optind]) {
+		return EXIT_SUCCESS;
+	} else if (!strcmp(argv[optind], "search")) {
 		return find(db, ".");
-	} else if (argv[optind] && !strcmp(argv[optind], "verify")) {
+	} else if (!strcmp(argv[optind], "verify")) {
 		char *query = sqlite3_mprintf("SELECT name, root FROM collections");
 		char **table, *errmsg;
 		int nrows, ncols, i;
@@ -452,10 +467,13 @@ main(int argc, char **argv)
 		}
 		sqlite3_free_table(table);
 		sqlite3_free(query);
+	} else if (!strcmp(argv[optind], "hunt")) {
 	} else {
 		fprintf(stderr, "Unknown command %s.\n"
 			"search - search local tree for files in db.\n"
-			"verify - verify files in collection directories.\n", argv[optind]);
+			"verify - verify files in collection directories.\n"
+			"hunt   - search local tree for files and move"
+			"         them into collections", argv[optind]);
 	}
 
 //Should call sqlite3_close(db) somewhere
