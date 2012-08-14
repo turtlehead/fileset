@@ -98,7 +98,7 @@ find_by_crc(sqlite3 *db, off_t size, unsigned int crc)
 		sqlite3_close(db);
 		return -1;
 	}
-fprintf(stderr, "nrows == %d\n", nrows);
+
 	if (nrows == 1) {
 		sscanf(table[1], "%d", &id);
 	} else if (nrows > 1) {
@@ -128,6 +128,8 @@ verify_file(sqlite3 *db, char *path, struct stat sb)
 	buffer = mmap(NULL, sb.st_size, PROT_READ, MAP_SHARED, in, 0);
 	mhash(td, buffer, sb.st_size);
 	mhash_deinit(td, hash);
+	munmap(buffer, sb.st_size);
+	close(in);
 	unsigned int ihash = (hash[3] << 24) + (hash[2] << 16) + (hash[1] << 8) + hash[0];
 
 	fprintf(stdout, "File: %s\t%d\t", path, sb.st_size);
