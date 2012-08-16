@@ -16,8 +16,16 @@
 
 #define COLLECTION 1
 #define SET 2
+
 #define CSV 1
 #define CMPRO 2
+
+#define SEARCH 1
+#define VERIFY 2
+#define HUNT 3
+#define COUNT 4
+#define COMMANDS 15
+#define VERBOSE 16
 
 #define CREATE_COLLECTIONS \
 "CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY AUTOINCREMENT," \
@@ -112,7 +120,7 @@ find_by_crc(sqlite3 *db, off_t size, unsigned int crc)
 }
 
 int
-verify_file(sqlite3 *db, char *path, struct stat sb)
+verify_file(sqlite3 *db, char *path, struct stat sb, int verbose)
 {
 	MHASH td;
 	unsigned char hash[20];
@@ -133,13 +141,15 @@ verify_file(sqlite3 *db, char *path, struct stat sb)
 	close(in);
 	unsigned int ihash = (hash[3] << 24) + (hash[2] << 16) + (hash[1] << 8) + hash[0];
 
-	fprintf(stdout, "File: %s\t%s\n", path, find_by_crc(db, sb.st_size, ihash)>0?"Found":"Unknown");
+	if (verbose) {
+		fprintf(stdout, "File: %s\t%s\n", path, find_by_crc(db, sb.st_size, ihash)>0?"Found":"Unknown");
+	}
 
 	return EXIT_SUCCESS;
 }
 
 int
-verify_zip(sqlite3 *db, char *path, struct zip *ziparc)
+verify_zip(sqlite3 *db, char *path, struct zip *ziparc, int verbose)
 {
 	int i;
 
@@ -157,14 +167,16 @@ verify_zip(sqlite3 *db, char *path, struct zip *ziparc)
 			continue;
 		}
 		zip_fclose(zfile);
-		fprintf(stdout, "ZFile: %s/%s\t%s\n", path, zip_get_name(ziparc, i, 0), find_by_crc(db, zsb.size, zsb.crc)>0?"Found":"Unknown");
+		if (verbose) {
+			fprintf(stdout, "ZFile: %s/%s\t%s\n", path, zip_get_name(ziparc, i, 0), find_by_crc(db, zsb.size, zsb.crc)>0?"Found":"Unknown");
+		}
 	}
 
 	return EXIT_SUCCESS;
 }
 
 int
-find(sqlite3 *db, char *path)
+find(sqlite3 *db, char *path, int mode)
 {
 	DIR		*dir;
 	struct dirent	*ent;
@@ -172,6 +184,7 @@ find(sqlite3 *db, char *path)
 	struct zip	*ziparc;
 	int		pathlen = strlen(path);
 	int		i, j;
+	int		count = 0;
 
 	if ((dir = opendir(path)) != NULL) {
 		while ((ent = readdir(dir)) != NULL) {
@@ -183,7 +196,7 @@ find(sqlite3 *db, char *path)
 			strcat(strcat(strcpy(fname, path), "/"), ent->d_name);
 			stat(fname, &sb);
 			if (S_ISDIR(sb.st_mode)) {
-				find(db, fname);
+				count += find(db, fname, mode);
 				free(fname);
 				continue;
 			} else if (S_ISLNK(sb.st_mode)) {
@@ -194,29 +207,45 @@ find(sqlite3 *db, char *path)
 				free(fname);
 				if (stat(realname, &lsb) == 0 
 				    && S_ISDIR(lsb.st_mode)) {
-					find(db, realname);
+					count +=find(db, realname, mode);
 					free(realname);
 					continue;
 				} else {
 					fname = realname;
 				}
 			} else if ((ziparc = open_zip(fname)) != NULL) {
-				verify_zip(db, fname, ziparc);
+				count += zip_get_num_files(ziparc);
+				if ((mode & COMMANDS) != COUNT) {
+					verify_zip(db, fname, ziparc, mode & VERBOSE);
+				}
+				zip_close(ziparc);
 			} else {
-				verify_file(db, fname, sb);
+				count++;
+				if ((mode & COMMANDS) != COUNT) {
+					verify_file(db, fname, sb, mode & VERBOSE);
+				}
 			}
 			free(fname);
+			if ((mode & COMMANDS) != COUNT && !(mode & VERBOSE)) {
+				fprintf(stdout, "\r%d files searched", count);
+			}
 		}
 		closedir(dir);
 	} else if ((ziparc = open_zip(path)) != NULL) {
-		verify_zip(db, path, ziparc);
+		count += zip_get_num_files(ziparc);
+		if ((mode & COMMANDS) != COUNT) {
+			verify_zip(db, path, ziparc, mode & VERBOSE);
+		}
 		zip_close(ziparc);
 	} else {
-		stat(path, &sb);
-		verify_file(db, path, sb);
+		count++;
+		if ((mode & COMMANDS) != COUNT) {
+			stat(path, &sb);
+			verify_file(db, path, sb, mode & VERBOSE);
+		}
 	}
 
-	return EXIT_SUCCESS;
+	return count;
 }
 
 // Still needs optimization & error handling.
@@ -246,7 +275,6 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 		char *values = NULL, *tok;
 		char *query;
 
-		fprintf(stdout, "Line: %s\n", line);
 		char *name = strtok(line, "\"");
 		strappend(&values, name);
 		while ((tok = strtok(NULL, ",\r\n")) != NULL) {
@@ -370,9 +398,10 @@ main(int argc, char **argv)
 	int	dat_flag = 0;
 	int	zip_flag = 0;
 	int	setup_flag = 0;
+	int	find_flags = 0;
 	FILE *in;
 
-	while ((opt = getopt(argc, argv, "c:d:m:r:sz")) != -1) {
+	while ((opt = getopt(argc, argv, "c:d:m:r:svz")) != -1) {
 		switch (opt) {
 		case 'c':
 			dat_flag = CSV;
@@ -391,6 +420,8 @@ main(int argc, char **argv)
 		case 's':
 			setup_flag = 1;
 			break;
+		case 'v':
+			find_flags |= VERBOSE;
 		case 'z':
 			zip_flag = 1;
 			break;
@@ -448,7 +479,9 @@ main(int argc, char **argv)
 	if (!argv[optind]) {
 		return EXIT_SUCCESS;
 	} else if (!strcmp(argv[optind], "search")) {
-		return find(db, ".");
+		fprintf(stdout, "Searching %d files\n", find(db, ".", COUNT));
+		return find(db, ".", SEARCH | find_flags);
+		fprintf(stdout, "\n");
 	} else if (!strcmp(argv[optind], "verify")) {
 		char *query = sqlite3_mprintf("SELECT name, root FROM collections");
 		char **table, *errmsg;
@@ -462,12 +495,13 @@ main(int argc, char **argv)
 		}
 		for (i = ncols; i < ((nrows+1)*ncols); i+=ncols) {
 			char *dir = sqlite3_mprintf("%s/%s", table[i+1], table[i]);
-			find(db, dir);
+			find(db, dir, VERIFY | find_flags);
 			sqlite3_free(dir);
 		}
 		sqlite3_free_table(table);
 		sqlite3_free(query);
 	} else if (!strcmp(argv[optind], "hunt")) {
+		return find(db, ".", HUNT | find_flags);
 	} else {
 		fprintf(stderr, "Unknown command %s.\n"
 			"search - search local tree for files in db.\n"
