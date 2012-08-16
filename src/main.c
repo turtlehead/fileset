@@ -191,6 +191,9 @@ verify_rar(sqlite3 *db, char *path, HANDLE *rararc, int verbose)
 			break;
 		}
 		RARProcessFile(rararc, RAR_SKIP, NULL, NULL);
+		if ((hdr.Flags & 0xe0) == 0xe0) {
+			continue;
+		}
 		count++;
 		if (verbose) {
 			fprintf(stdout, "RFile: %s/%s\t%s\n", path, hdr.FileName, find_by_crc(db, hdr.UnpSize, hdr.FileCRC)>0?"Found":"Unknown");
@@ -203,17 +206,22 @@ verify_rar(sqlite3 *db, char *path, HANDLE *rararc, int verbose)
 }
 
 HANDLE
-rar_open(char *fname)
+rar_open(char *path)
 {
-	HANDLE ret;
+	HANDLE arc;
 	struct RAROpenArchiveDataEx in = {0};
 
-	in.ArcName = fname;
+	in.ArcName = path;
 	in.OpenMode = RAR_OM_EXTRACT;
 
-	ret = RAROpenArchiveEx(&in);
+	if ((arc = RAROpenArchiveEx(&in)) == NULL) {
+		char *rpath = sqlite3_mprintf("%s.rar", path);
+		in.ArcName = rpath;
+		arc = RAROpenArchiveEx(&in);
+		sqlite3_free(rpath);
+	}
 
-	return ret;
+	return arc;
 }
 
 void
@@ -310,6 +318,13 @@ find(sqlite3 *db, char *path, int mode)
 			verify_zip(db, path, ziparc, mode & VERBOSE);
 		}
 		zip_close(ziparc);
+	} else if ((rararc = rar_open(path)) != NULL) {
+		if ((mode & COMMANDS) == COUNT) {
+			count += rar_get_num_files(rararc);
+		} else {
+			count += verify_rar(db, path, rararc, mode & VERBOSE);
+		}
+		rar_close(rararc);
 	} else {
 		count++;
 		if ((mode & COMMANDS) != COUNT) {
