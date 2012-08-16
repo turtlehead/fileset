@@ -14,6 +14,8 @@
 #include <sqlite3.h>
 #include <zip.h>
 
+#include "dll.hpp"
+
 #define COLLECTION 1
 #define SET 2
 
@@ -134,7 +136,7 @@ verify_file(sqlite3 *db, char *path, struct stat sb, int verbose)
 		return EXIT_FAILURE;
 	}
 	unsigned char *buffer;
-	buffer = mmap(NULL, sb.st_size, PROT_READ, MAP_SHARED, in, 0);
+	buffer = (unsigned char *)mmap(NULL, sb.st_size, PROT_READ, MAP_SHARED, in, 0);
 	mhash(td, buffer, sb.st_size);
 	mhash_deinit(td, hash);
 	munmap(buffer, sb.st_size);
@@ -176,12 +178,76 @@ verify_zip(sqlite3 *db, char *path, struct zip *ziparc, int verbose)
 }
 
 int
+verify_rar(sqlite3 *db, char *path, HANDLE *rararc, int verbose)
+{
+	int i;
+
+	int count = 0;
+
+	for (;;) {
+		struct RARHeaderDataEx hdr = {0};
+		int retval;
+		if ((retval = RARReadHeaderEx(rararc, &hdr)) != 0) {
+			break;
+		}
+		RARProcessFile(rararc, RAR_SKIP, NULL, NULL);
+		count++;
+		if (verbose) {
+			fprintf(stdout, "RFile: %s/%s\t%s\n", path, hdr.FileName, find_by_crc(db, hdr.UnpSize, hdr.FileCRC)>0?"Found":"Unknown");
+		}
+	}
+
+	return count;
+
+	return EXIT_SUCCESS;
+}
+
+HANDLE
+rar_open(char *fname)
+{
+	HANDLE ret;
+	struct RAROpenArchiveDataEx in = {0};
+
+	in.ArcName = fname;
+	in.OpenMode = RAR_OM_EXTRACT;
+
+	ret = RAROpenArchiveEx(&in);
+
+	return ret;
+}
+
+void
+rar_close(HANDLE rararc)
+{
+	RARCloseArchive(rararc);
+}
+
+int
+rar_get_num_files(HANDLE rararc)
+{
+	int count = 0;
+
+	for (;;) {
+		struct RARHeaderDataEx hdr = {0};
+		int retval;
+		if ((retval = RARReadHeaderEx(rararc, &hdr)) != 0) {
+			break;
+		}
+		RARProcessFile(rararc, RAR_SKIP, NULL, NULL);
+		count++;
+	}
+
+	return count;
+}
+
+int
 find(sqlite3 *db, char *path, int mode)
 {
 	DIR		*dir;
 	struct dirent	*ent;
 	struct stat	sb;
 	struct zip	*ziparc;
+	HANDLE		rararc;
 	int		pathlen = strlen(path);
 	int		i, j;
 	int		count = 0;
@@ -219,6 +285,13 @@ find(sqlite3 *db, char *path, int mode)
 					verify_zip(db, fname, ziparc, mode & VERBOSE);
 				}
 				zip_close(ziparc);
+			} else if ((rararc = rar_open(fname)) != NULL) {
+				if ((mode & COMMANDS) == COUNT) {
+					count += rar_get_num_files(rararc);
+				} else {
+					count += verify_rar(db, fname, rararc, mode & VERBOSE);
+				}
+				rar_close(rararc);
 			} else {
 				count++;
 				if ((mode & COMMANDS) != COUNT) {
