@@ -31,6 +31,7 @@
 #define VERBOSE 16	// Verbose status messages
 #define ZIP 32		// Put hunted files in a zip, not a dir
 #define DELETE 64	// Move found files, don't copy
+#define ONLY_DELETE 128	// If DELETE is set, only delete, don't try to move
 
 #define CREATE_COLLECTIONS \
 "CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY AUTOINCREMENT," \
@@ -54,7 +55,8 @@
 				  "crc UNSIGNED INTEGER," \
 				  "md5 CHARACTER(32)," \
 				  "sha1 CHARACTER(40)," \
-				  "comment VARCHAR)"
+				  "comment VARCHAR," \
+				  "found INTEGER DEFAULT 0)"
 
 #define SQL_INSERT(db, ...) { \
 	char *query = sqlite3_mprintf(__VA_ARGS__); \
@@ -64,10 +66,12 @@
 		sqlite3_free(errmsg); \
 		sqlite3_free(query); \
 		sqlite3_close(db); \
-		return EXIT_FAILURE; \
+		exit(-1); \
 	} \
 	sqlite3_free(query); \
 }
+
+#define SQL_UPDATE(db, ...) SQL_INSERT(db, __VA_ARGS__)
 
 struct zipinfo {
 	struct zip	*zarc;
@@ -150,7 +154,9 @@ move_file(char *src, char *dest_dir, char *dest_file, void *user, int mode)
 {
 	char	*dest = sqlite3_mprintf("%s/%s", dest_dir, dest_file);
 
-	errno = 0;
+	if (mode & DELETE && mode & ONLY_DELETE) {
+		unlink(src);
+	}
 	if (mode & ZIP) {
 		make_dirtree(dest_dir);
 		struct zip	*zip;
@@ -269,11 +275,12 @@ archive_file(sqlite3 *db, char *src, int id, int (*mover)(char *, char *, char *
 	int nrows, ncols;
 
 	query = sqlite3_mprintf("SELECT RTRIM(c.root, '/ ') || '/' || TRIM(c.name, '/ '), "
-								   "RTRIM(s.name, '/ ') || '/' || f.name "
-							"FROM collections c, sets s, files f "
-							"WHERE c.id = s.collection_id "
-							  "AND s.id = f.set_id "
-							  "AND f.id = %d", id);
+				  "RTRIM(s.name, '/ ') || '/' || f.name, "
+				  "f.found "
+				"FROM collections c, sets s, files f "
+				"WHERE c.id = s.collection_id "
+				  "AND s.id = f.set_id "
+				  "AND f.id = %d", id);
 	if (sqlite3_get_table(db, query, &table, &nrows, &ncols, &errmsg) != SQLITE_OK) {
 		fprintf(stderr, "SQL error: %s\n", errmsg);
 		sqlite3_free(errmsg);
@@ -282,7 +289,7 @@ archive_file(sqlite3 *db, char *src, int id, int (*mover)(char *, char *, char *
 		return NULL;
 	}
 	if (nrows == 1) {
-		mover(src, table[2], table[3], user, mode);
+		mover(src, table[3], table[4], user, mode | ((table[5][0]=='1')?ONLY_DELETE:0));
 		dest = sqlite3_mprintf("%s/%s", table[2], table[3]);
 	} else if (nrows > 1) {
 		fprintf(stderr, "Error: multiple size/crc matches\n");
@@ -314,7 +321,9 @@ verify_file(sqlite3 *db, char *path, struct stat sb, int mode)
 	munmap(buffer, sb.st_size);
 	close(in);
 	unsigned int ihash = (hash[3] << 24) + (hash[2] << 16) + (hash[1] << 8) + hash[0];
-	id = find_by_crc(db, sb.st_size, ihash);
+	if ((id = find_by_crc(db, sb.st_size, ihash)) > 0) {
+		SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
+	}
 	if (mode & HUNT && id > 0) {
 		char *dest = archive_file(db, path, id, &move_file, NULL, mode);
 		fprintf(stderr, "Move %s to %s\n", path, dest);
@@ -344,7 +353,9 @@ verify_zip(sqlite3 *db, char *path, struct zip *ziparc, int mode)
 			continue;
 		}
 		count++;
-		id = find_by_crc(db, zsb.size, zsb.crc);
+		if ((id = find_by_crc(db, zsb.size, zsb.crc)) > 0) {
+			SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
+		}
 		if (mode & HUNT) {
 			struct zipinfo zi = {ziparc, zfile, i};
 			char *dest = archive_file(db, path, id, &move_zip, &zi, mode);
@@ -378,7 +389,9 @@ verify_rar(sqlite3 *db, char *path, HANDLE *rararc, int mode)
 			continue;
 		}
 		count++;
-		id = find_by_crc(db, hdr.UnpSize, hdr.FileCRC);
+		if ((id = find_by_crc(db, hdr.UnpSize, hdr.FileCRC)) > 0) {
+			SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
+		}
 		if (mode & SEARCH || mode & VERIFY || mode & COUNT) {
 			RARProcessFile(rararc, RAR_SKIP, NULL, NULL);
 		} else if (mode & HUNT) {
@@ -626,7 +639,7 @@ load_cmpro_dat(char *in_file, char *root, sqlite3 *db)
 				while ((rtag = strtok(NULL, " \t")) != NULL) {
 					if (!strcmp(rtag, "(") || !strncmp(rtag, ")", 1)) {
 						continue;
-					} else if (!strcmp(rtag, "name")) {
+					} else if (!strcmp(rtag, "name") || !strcmp(rtag, "description") || !strcmp(rtag, "comment")) {
 						strappend(&rvalues, strtok(NULL, "\""));
 					} else if (!strcmp(rtag, "crc")) {
 						char decbuf[32];
@@ -759,8 +772,12 @@ main(int argc, char **argv)
 		if (load_csv(crcname, root, db) == EXIT_FAILURE)
 			return EXIT_FAILURE;
 	} else if (dat_flag == CMPRO) {
-		if (load_cmpro_dat(crcname, root, db) == EXIT_FAILURE)
-			return EXIT_FAILURE;
+		char *actual_root = realpath(root, NULL);
+		if (actual_root) {
+			if (load_cmpro_dat(crcname, actual_root, db) == EXIT_FAILURE)
+				return EXIT_FAILURE;
+			free(actual_root);
+		}
 	}
 
 	if (!argv[optind]) {
@@ -769,6 +786,7 @@ main(int argc, char **argv)
 		fprintf(stdout, "Searching %d files\n", find(db, ".", COUNT));
 		fprintf(stdout, "\r%d files searched\n", find(db, ".", SEARCH | find_flags));
 	} else if (!strcmp(argv[optind], "verify")) {
+		SQL_UPDATE(db, "UPDATE files SET found=0");
 		char *query = sqlite3_mprintf("SELECT name, root FROM collections");
 		char **table, *errmsg;
 		int nrows, ncols, i;
@@ -789,7 +807,7 @@ main(int argc, char **argv)
 	} else if (!strcmp(argv[optind], "hunt")) {
 		find(db, ".", HUNT | find_flags);
 	} else if (!strcmp(argv[optind], "list")) {
-		char *query = sqlite3_mprintf("SELECT name, root FROM collections");
+		char *query = sqlite3_mprintf("SELECT c.name, c.root, (SELECT COUNT(*) FROM sets WHERE collection_id=c.id), COUNT(f.id), SUM(f.found) FROM collections c, sets s, files f WHERE c.id = s.collection_id AND s.id = f.set_id group by c.id");
 		char **table, *errmsg;
 		int nrows, ncols, i;
 		if (sqlite3_get_table(db, query, &table, &nrows, &ncols, &errmsg) != SQLITE_OK) {
@@ -799,8 +817,9 @@ main(int argc, char **argv)
 			sqlite3_close(db);
 			return EXIT_FAILURE;
 		}
+		fprintf(stdout, "%d Collections:\n", nrows);
 		for (i = ncols; i < ((nrows+1)*ncols); i+=ncols) {
-			fprintf(stdout, "%s:\t%s\n", table[i], table[i+1]);
+			fprintf(stdout, "%s:\t%s -- %s/%s\n", table[i], table[i+2], table[i+4], table[i+3]);
 		}
 		sqlite3_free_table(table);
 		sqlite3_free(query);
