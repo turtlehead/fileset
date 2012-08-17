@@ -31,7 +31,7 @@
 #define VERBOSE 16	// Verbose status messages
 #define ZIP 32		// Put hunted files in a zip, not a dir
 #define DELETE 64	// Move found files, don't copy
-#define ONLY_DELETE 128	// If DELETE is set, only delete, don't try to move
+#define ONLY_DELETE 128	// Don't try to move, only delete if DELETE is set
 
 #define CREATE_COLLECTIONS \
 "CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY AUTOINCREMENT," \
@@ -154,10 +154,11 @@ move_file(char *src, char *dest_dir, char *dest_file, void *user, int mode)
 {
 	char	*dest = sqlite3_mprintf("%s/%s", dest_dir, dest_file);
 
-	if (mode & DELETE && mode & ONLY_DELETE) {
-		unlink(src);
-	}
-	if (mode & ZIP) {
+	if (mode & ONLY_DELETE) {
+		if (mode & DELETE) {
+			unlink(src);
+		}
+	} else if (mode & ZIP) {
 		make_dirtree(dest_dir);
 		struct zip	*zip;
 		if ((zip = open_zip(dest_dir, 1)) != NULL) {
@@ -207,8 +208,9 @@ move_zip(char *src, char *dest_dir, char *dest_file, void *zi, int mode)
 	char	*dest = sqlite3_mprintf("%s/%s", dest_dir, dest_file);
 	struct zipinfo *zinfo = (struct zipinfo *)zi;
 
-	errno = 0;
-	if (mode & ZIP) {
+
+	if (mode & ONLY_DELETE) {
+	} else if (mode & ZIP) {
 		make_dirtree(dest_dir);
 		struct zip	*zip;
 		if ((zip = open_zip(dest_dir, 1)) != NULL) {
@@ -241,8 +243,8 @@ move_rar(char *src, char *dest_dir, char *dest_file, void *rar, int mode)
 {
 	char	*dest = sqlite3_mprintf("%s/%s", dest_dir, dest_file);
 
-	errno = 0;
-	if (mode & ZIP) {
+	if (mode & ONLY_DELETE) {
+	} else if (mode & ZIP) {
 		make_dirtree(dest_dir);
 		struct zip	*zip;
 		if ((zip = open_zip(dest_dir, 1)) != NULL) {
