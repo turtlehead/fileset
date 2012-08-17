@@ -206,7 +206,7 @@ move_file(char *src, char *dest_dir, char *dest_file, int mode)
 			pwrite(out, "", 1, sb.st_size - 1);
 			unsigned char *srcbuf, *destbuf;
 			srcbuf = (unsigned char *)mmap(NULL, sb.st_size, PROT_READ, MAP_SHARED, in, 0);
-			destbuf = (unsigned char *)mmap(NULL, sb.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, out, 0);
+			destbuf = (unsigned char *)mmap(NULL, sb.st_size, PROT_WRITE, MAP_SHARED, out, 0);
 			memcpy(destbuf, srcbuf, sb.st_size);
 			munmap(srcbuf, sb.st_size);
 			munmap(destbuf, sb.st_size);
@@ -277,19 +277,10 @@ verify_file(sqlite3 *db, char *path, struct stat sb, int mode)
 	munmap(buffer, sb.st_size);
 	close(in);
 	unsigned int ihash = (hash[3] << 24) + (hash[2] << 16) + (hash[1] << 8) + hash[0];
-
-	if (mode & HUNT && (id = find_by_crc(db, sb.st_size, ihash)) > 0) {
+fprintf(stderr, "crc = %.8x %d\n", ihash, ihash);
+	id = find_by_crc(db, sb.st_size, ihash);
+	if (mode & HUNT && id > 0) {
 		char *dest = archive_file(db, path, id, &move_file, mode);
-		// if db.files.found = 0 {
-		// 1. ensure directory/zip file dest(mode&ZIP) exists
-		// 2. put copy into dest.
-		//    make move_[file|zip|rar]() so this can all be
-		//    in one function (chg get_file_name -> move_file
-		// 4. update db.files.found col }
-		// 3. remove source(mode&DELETE). Not for files in arcs
-		// 5. update md5, sha1 if not currently known(mode&ALL_SUMS)
-		// should this be done in a sqlite3_create_function?
-// update files set found=move_file(name) where found=0 and id=%d
 		fprintf(stderr, "Move %s to %s\n", path, dest);
 		sqlite3_free(dest);
 	}
