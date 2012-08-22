@@ -295,7 +295,8 @@ archive_file(sqlite3 *db, char *src, int id, int (*mover)(char *, char *, char *
 	}
 	if (nrows == 1) {
 		mover(src, table[3], table[4], user, mode | ((table[5][0]=='1')?ONLY_DELETE:0));
-		dest = sqlite3_mprintf("%s/%s", table[2], table[3]);
+		dest = sqlite3_mprintf("%s/%s", table[3], table[4]);
+		SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
 	} else if (nrows > 1) {
 		fprintf(stderr, "Error: multiple size/crc matches\n");
 	}
@@ -326,13 +327,11 @@ verify_file(sqlite3 *db, char *path, struct stat sb, int mode)
 	munmap(buffer, sb.st_size);
 	close(in);
 	unsigned int ihash = (hash[3] << 24) + (hash[2] << 16) + (hash[1] << 8) + hash[0];
+	id = find_by_crc(db, sb.st_size, ihash);
 	if (mode & HUNT && id > 0) {
 		char *dest = archive_file(db, path, id, &move_file, NULL, mode);
 		fprintf(stderr, "Move %s to %s\n", path, dest);
 		sqlite3_free(dest);
-	}
-	if ((id = find_by_crc(db, sb.st_size, ihash)) > 0) {
-		SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
 	}
 	if (mode & VERBOSE) {
 		fprintf(stdout, "File: %s\t%s\n", path, id>0?"Found":"Unknown");
@@ -358,16 +357,14 @@ verify_zip(sqlite3 *db, char *path, struct zip *ziparc, int mode)
 			continue;
 		}
 		count++;
-		if (mode & HUNT) {
+		id = find_by_crc(db, zsb.size, zsb.crc);
+		if (mode & HUNT && id > 0) {
 			struct zipinfo zi = {ziparc, zfile, i};
 			char *dest = archive_file(db, path, id, &move_zip, &zi, mode);
 			fprintf(stderr, "Move %s to %s\n", path, dest);
 			sqlite3_free(dest);
 		}
 		zip_fclose(zfile);
-		if ((id = find_by_crc(db, zsb.size, zsb.crc)) > 0) {
-			SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
-		}
 		if (mode & VERBOSE) {
 			fprintf(stdout, "ZFile: %s/%s\t%s\n", path, zip_get_name(ziparc, i, 0), id>0?"Found":"Unknown");
 		}
@@ -394,15 +391,13 @@ verify_rar(sqlite3 *db, char *path, HANDLE *rararc, int mode)
 			continue;
 		}
 		count++;
+		id = find_by_crc(db, hdr.UnpSize, hdr.FileCRC);
 		if (mode & SEARCH || mode & VERIFY || mode & COUNT) {
 			RARProcessFile(rararc, RAR_SKIP, NULL, NULL);
-		} else if (mode & HUNT) {
+		} else if (mode & HUNT && id > 0) {
 			char *dest = archive_file(db, path, id, &move_rar, rararc, mode);
 			fprintf(stderr, "Move %s to %s\n", path, dest);
 			sqlite3_free(dest);
-		}
-		if ((id = find_by_crc(db, hdr.UnpSize, hdr.FileCRC)) > 0) {
-			SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
 		}
 		if (mode & VERBOSE) {
 			fprintf(stdout, "RFile: %s/%s\t%s\n", path, hdr.FileName, id>0?"Found":"Unknown");
@@ -574,41 +569,60 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 	char line[2048];
 	while (fgets(line, 2048, input)) {
 		int vcount = 0;
-		char *values = NULL, *tok;
-		char *query;
+		char *tok;
 
-		// need to filter out lone \ chars
-		char *name = strtok(line, "\",");
-		if (!strcmp(name, "\\") || name[0] == '\0') {
-			strappend(&values, "/");
-		} else {
-			strappend(&values, name);
-		}
-		while ((tok = strtok(NULL, ",\r\n")) != NULL) {
-			if (vcount == 1) {
-				char decbuf[32];
-				unsigned int hexbuf;
-				sscanf(tok, "%x", &hexbuf);
-				sprintf(decbuf, "%u", hexbuf);
-				strappend(&values, decbuf);
-			} else if (vcount == 2) {
-				if (!set_name || strcmp(set_name, tok)) {
-					free(set_name);
-					set_name = strdup(tok);
-					SQL_INSERT(db, "INSERT INTO sets (collection_id, name) VALUES (%d, %Q)", collection_id, set_name);
-					set_id = sqlite3_last_insert_rowid(db);
+		char *field[5] = {0};
+		while ((tok = strtok(vcount == 0 ? line : NULL, ",\r\n")) != NULL && vcount < 5) {
+			int merged = 0;
+			if (vcount > 0) {
+				int lastchar = strlen(field[vcount-1])-1;
+				if ((field[vcount-1][lastchar] == '\\') || // handle str\,str
+				    (field[vcount-1][0] == '"' && field[vcount-1][lastchar] != '"') || // handle "str,str"
+				    (field[vcount-1][0] == '\'' && field[vcount-1][lastchar] != '\'')) { // handle 'str,str'
+					*--tok = ',';
+					merged = 1;
 				}
-			} else {
-				strappend(&values, tok);
 			}
-			vcount++;
+			if (merged == 0 && field[vcount] == NULL) {
+				field[vcount++] = tok;
+			}
 		}
-		if (vcount == 4) {
-			SQL_INSERT(db, "INSERT INTO files (set_id, name, size, crc, comment) VALUES (%d, %s)", set_id, values);
+
+		int i;
+		for (i = 0; i < vcount; i++) {
+			int lastchar = strlen(field[i])-1;
+			if (field[i][0] == field[i][lastchar] && (field[i][0] == '\'' || field[i][0] == '"')) {
+				field[i][lastchar] = '\0';
+				field[i]++;
+			}
+		}
+
+		char decbuf[32];
+		unsigned int hexbuf;
+		sscanf(field[2], "%x", &hexbuf);
+		sprintf(decbuf, "%u", hexbuf);
+		
+		if (!set_name || strcmp(set_name, field[3])) {
+			free(set_name);
+			set_name = strdup(field[3]);
+			if (!strcmp(set_name, "\\")) {
+				SQL_INSERT(db, "INSERT INTO sets (collection_id, name) VALUES (%d, '/')", collection_id);
+			} else {
+				SQL_INSERT(db, "INSERT INTO sets (collection_id, name) VALUES (%d, %Q)", collection_id, set_name);
+			}
+			set_id = sqlite3_last_insert_rowid(db);
+		}
+
+		if (vcount == 5) {
+			SQL_INSERT(db, "INSERT INTO files (set_id, name, size, crc, comment) VALUES (%d, %Q, %s, %s, %Q)", set_id, field[0], field[1], decbuf, field[4]);
+		} else if (vcount == 4) {
+			SQL_INSERT(db, "INSERT INTO files (set_id, name, size, crc) VALUES (%d, %Q, %s, %s)", set_id, field[0], field[1], decbuf);
 		} else {
-			SQL_INSERT(db, "INSERT INTO files (set_id, name, size, crc) VALUES (%d, %s)", set_id, values);
+			fprintf(stderr, "error: incorrect number of columns\n");
+			return EXIT_FAILURE;
 		}
-		sqlite3_free(values);
+
+		continue;
 	}
 
 	fclose(input);
