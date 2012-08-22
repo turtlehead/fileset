@@ -4,3 +4,5 @@ include_directories("${PROJECT_SOURCE_DIR}/src/unrar")
 add_definitions(-D_UNIX)
 add_executable(fileset main.c)
 target_link_libraries(fileset UnRar ${SQLITE3_LIBRARY} ${MHASH_LIBRARY})
+
+install(TARGETS fileset DESTINATION bin)

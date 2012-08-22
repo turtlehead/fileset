@@ -530,7 +530,7 @@ find(sqlite3 *db, char *path, int mode)
 				}
 			} else if ((ziparc = open_zip(fname, 0)) != NULL) {
 				if (mode & COUNT) {
-					count += zip_get_num_entries(ziparc, 0);
+					count += mz_zip_reader_get_num_files(ziparc);
 				} else {
 					count += verify_zip(db, fname, ziparc, mode);
 				}
@@ -556,7 +556,7 @@ find(sqlite3 *db, char *path, int mode)
 		closedir(dir);
 	} else if ((ziparc = open_zip(path, 0)) != NULL) {
 		if (mode & COUNT) {
-			count += zip_get_num_entries(ziparc, 0);
+			count += mz_zip_reader_get_num_files(ziparc);
 		} else {
 			count += verify_zip(db, path, ziparc, mode);
 		}
