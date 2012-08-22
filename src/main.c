@@ -579,7 +579,6 @@ find(sqlite3 *db, char *path, int mode)
 	return count;
 }
 
-// Still needs optimization & error handling.
 int
 load_csv(char *in_file, char *root, sqlite3 *db)
 {
@@ -593,6 +592,17 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 		return EXIT_FAILURE;
 	}
 
+	const char *prep_stmt, *tail;
+	sqlite3_stmt *set_stmt, *file_stmt;
+	prep_stmt = sqlite3_mprintf("INSERT INTO sets (collection_id, name) VALUES (@CID, @NM)");
+	sqlite3_prepare_v2(db, prep_stmt, strlen(prep_stmt), &set_stmt, &tail);
+	sqlite3_free((char *)prep_stmt);
+	prep_stmt = sqlite3_mprintf("INSERT INTO files (set_id, name, size, crc, comment) VALUES (@SID, @NM, @SZ, @CRC, @COM)");
+	sqlite3_prepare_v2(db, prep_stmt, strlen(prep_stmt), &file_stmt, &tail);
+	sqlite3_free((char *)prep_stmt);
+
+	sqlite3_exec(db, "BEGIN TRANSACTION", NULL, NULL, &errmsg);
+
 	char *dot = strrchr(in_file, '.');
 	if (dot) {
 		*dot = '\0';
@@ -601,8 +611,9 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 	SQL_INSERT(db, "INSERT INTO collections (name, root) VALUES (%Q, %Q)", fname == NULL ? in_file : fname+1, root);
 	collection_id = sqlite3_last_insert_rowid(db);
 
-	char line[2048];
-	while (fgets(line, 2048, input)) {
+	char	*line;
+	size_t	nchars;
+	while (getline(&line, &nchars, input) >= 0) {
 		int vcount = 0;
 		char *tok;
 
@@ -640,32 +651,36 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 		if (!set_name || strcmp(set_name, field[3])) {
 			free(set_name);
 			set_name = strdup(field[3]);
+			sqlite3_bind_int(set_stmt, 1, collection_id);
 			if (!strcmp(set_name, "\\")) {
-				SQL_INSERT(db, "INSERT INTO sets (collection_id, name) VALUES (%d, '/')", collection_id);
+				sqlite3_bind_text(set_stmt, 2, "/", 1, SQLITE_STATIC);
 			} else {
-				SQL_INSERT(db, "INSERT INTO sets (collection_id, name) VALUES (%d, %Q)", collection_id, set_name);
+				sqlite3_bind_text(set_stmt, 2, set_name, -1, NULL);
 			}
+			sqlite3_step(set_stmt);
 			set_id = sqlite3_last_insert_rowid(db);
 		}
 
+		sqlite3_bind_int(file_stmt, 1, set_id);
+		sqlite3_bind_text(file_stmt, 2, field[0], -1, NULL);
+		sqlite3_bind_text(file_stmt, 3, field[1], -1, NULL);
+		sqlite3_bind_text(file_stmt, 4, decbuf, -1, NULL);
 		if (vcount == 5) {
-			SQL_INSERT(db, "INSERT INTO files (set_id, name, size, crc, comment) VALUES (%d, %Q, %s, %s, %Q)", set_id, field[0], field[1], decbuf, field[4]);
-		} else if (vcount == 4) {
-			SQL_INSERT(db, "INSERT INTO files (set_id, name, size, crc) VALUES (%d, %Q, %s, %s)", set_id, field[0], field[1], decbuf);
+			sqlite3_bind_text(file_stmt, 5, field[4], -1, NULL);
 		} else {
-			fprintf(stderr, "error: incorrect number of columns\n");
-			return EXIT_FAILURE;
+			sqlite3_bind_null(file_stmt, 5);
 		}
+		sqlite3_step(file_stmt);
 
 		continue;
 	}
+
+	sqlite3_exec(db, "END TRANSACTION", NULL, NULL, &errmsg);
 
 	fclose(input);
 	return EXIT_SUCCESS;
 }
 
-// Still needs header handling, other fields.
-// Also optimization & error handling.
 int
 load_cmpro_dat(char *in_file, char *root, sqlite3 *db)
 {
@@ -677,8 +692,10 @@ load_cmpro_dat(char *in_file, char *root, sqlite3 *db)
 		return EXIT_FAILURE;
 	}
 
-	char line[2048];
-	while (fgets(line, 2048, input)) {
+
+	char	*line;
+	size_t	nchars;
+	while (getline(&line, &nchars, input)) {
 		char *tags = NULL, *values = NULL, *files = NULL;
 		char *query;
 		int table, collection_id;
@@ -827,6 +844,8 @@ main(int argc, char **argv)
 		sqlite3_close(db);
 		return EXIT_FAILURE;
 	}
+	sqlite3_exec(db, "PRAGMA synchronous = OFF", NULL, NULL, &errmsg);
+	sqlite3_exec(db, "PRAGMA journal_mode = MEMORY", NULL, NULL, &errmsg);
 
 	if (!argv[optind]) {
 		return EXIT_SUCCESS;
