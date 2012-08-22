@@ -12,9 +12,9 @@
 
 #include <mhash.h>
 #include <sqlite3.h>
-#include <zip.h>
 
 #include "dll.hpp"
+#include "miniz.c"
 
 #define COLLECTION 1
 #define SET 2
@@ -74,9 +74,14 @@
 #define SQL_UPDATE(db, ...) SQL_INSERT(db, __VA_ARGS__)
 
 struct zipinfo {
-	struct zip	*zarc;
-	struct zip_file	*zfile;
-	int		index;
+	mz_zip_archive			*zip;
+	mz_zip_archive_file_stat	*stat;
+	int				index;
+};
+
+struct rarinfo {
+	HANDLE			rar;
+	struct RARHeaderDataEx	*hdr;
 };
 
 char *
@@ -91,16 +96,21 @@ strappend(char **str, char *frag)
 	return *str;
 }
 
-struct zip *
+mz_zip_archive *
 open_zip(char *path, int create)
 {
-	struct zip	*arc = NULL;
-	int		error = 0;
+	mz_zip_archive	*arc;
+	int		status = 0, i;
 
-	if ((arc = zip_open(path, 0, &error)) == NULL) {
+	arc = (mz_zip_archive *)calloc(1, sizeof(mz_zip_archive));
+	if (!(status = mz_zip_reader_init_file(arc, path, 0))) {
 		char *zpath = sqlite3_mprintf("%s.zip", path);
-		arc = zip_open(zpath, create == 1 ? ZIP_CREATE : 0, &error);
+		status = mz_zip_reader_init_file(arc, zpath, 0);
 		sqlite3_free(zpath);
+	}
+	if (!status) {
+		free(arc);
+		arc = NULL;
 	}
 
 	return arc;
@@ -155,34 +165,39 @@ make_dirtree(char *path, int make_leaf)
 int
 move_file(char *src, char *dest_dir, char *dest_file, void *user, int mode)
 {
-	char	*dest = sqlite3_mprintf("%s/%s", dest_dir, dest_file);
+	char	*dest;
+
+	int in;
+	struct stat sb;
 
 	if (mode & ONLY_DELETE) {
 		if (mode & DELETE) {
 			unlink(src);
 		}
-	} else if (mode & ZIP) {
+		return 0;
+	}
+
+	if ((in = open(src, O_RDONLY)) == -1) {
+		return -1;
+	}
+	stat(src, &sb);
+	if (mode & ZIP) {
+		dest = sqlite3_mprintf("%s.zip", dest_dir);
+		char *buffer = (char *)malloc(sb.st_size);
+		int count = 0;
+
 		make_dirtree(dest_dir, 0);
-		struct zip	*zip;
-		if ((zip = open_zip(dest_dir, 1)) != NULL) {
-			struct zip_source *s = zip_source_file(zip, src, 0, 0);
-			if (zip_add(zip, dest_file, s) == -1) {
-				fprintf(stderr, "zip error: %s\n", zip_strerror(zip));
-			}
-			zip_close(zip);
+		while ((count += read(in, buffer+count, sb.st_size-count)) < sb.st_size);
+		if (!mz_zip_add_mem_to_archive_file_in_place(dest, dest_file, buffer, sb.st_size, NULL, 0, MZ_NO_COMPRESSION)) {
+			fprintf(stderr, "error: mz_zip_add_mem_to_archive_file_in_place failed, %d\n");
+			return -1;
 		}
-		if (mode & DELETE) {
-			unlink(src);
-		}
+		free(buffer);
 	} else {
+		dest =  sqlite3_mprintf("%s/%s", dest_dir, dest_file);
 		make_dirtree(dest, 0);
 		if (!(mode & DELETE) || (rename(src, dest) == -1 && errno == EXDEV)) {
-			int in, out;
-			struct stat sb;
-			if ((in = open(src, O_RDONLY)) == -1) {
-				return -1;
-			}
-			stat(src, &sb);
+			int out;
 			if ((out = open(dest, O_RDWR | O_CREAT | O_TRUNC, sb.st_mode)) == -1) {
 				return -1;
 			}
@@ -193,75 +208,95 @@ move_file(char *src, char *dest_dir, char *dest_file, void *user, int mode)
 			memcpy(destbuf, srcbuf, sb.st_size);
 			munmap(srcbuf, sb.st_size);
 			munmap(destbuf, sb.st_size);
-			close(in);
 			close(out);
-			if (mode & DELETE) {
-				unlink(src);
-			}
 		}
 	}
 	
+	close(in);
+	if (mode & DELETE) {
+		unlink(src);
+	}
 	sqlite3_free(dest);
 	return 0;
 }
+
 
 int
 move_zip(char *src, char *dest_dir, char *dest_file, void *zi, int mode)
 {
-	char	*dest = sqlite3_mprintf("%s/%s", dest_dir, dest_file);
-	struct zipinfo *zinfo = (struct zipinfo *)zi;
+	char		*dest;
+	struct zipinfo	*zip = (struct zipinfo *)zi;
 
 
 	if (mode & ONLY_DELETE) {
 	} else if (mode & ZIP) {
+		dest = sqlite3_mprintf("%s.zip", dest_dir);
+		char *buffer = (char *)malloc(zip->stat->m_uncomp_size);
+
 		make_dirtree(dest_dir, 0);
-		struct zip	*zip;
-		if ((zip = open_zip(dest_dir, 1)) != NULL) {
-			struct zip_source *s = zip_source_zip(zip, zinfo->zarc, zinfo->index, 0, 0, 0);
-			if (zip_add(zip, dest_file, s) == -1) {
-				fprintf(stderr, "zip error: %s\n", zip_strerror(zip));
-			}
-			zip_close(zip);
-		}
-	} else {
-		make_dirtree(dest, 0);
-		int out;
-		if ((out = open(dest, O_RDWR | O_CREAT | O_TRUNC, S_IRWXU | S_IRWXG | S_IRWXO)) == -1) {
+		mz_zip_reader_extract_to_mem(zip->zip, zip->index, buffer, zip->stat->m_uncomp_size, 0);
+		if (!mz_zip_add_mem_to_archive_file_in_place(dest, dest_file, buffer, zip->stat->m_uncomp_size, NULL, 0, MZ_NO_COMPRESSION)) {
+			fprintf(stderr, "error: mz_zip_add_mem_to_archive_file_in_place failed, %d\n");
 			return -1;
 		}
-		int bytes; 
-		char buffer[1024];
-		while ((bytes = zip_fread(zinfo->zfile, buffer, 1024)) > 0) {
-			write(out, buffer, bytes);
-		}
-		close(out);
+		free(buffer);
+	} else {
+		dest = sqlite3_mprintf("%s/%s", dest_dir, dest_file);
+		make_dirtree(dest, 0);
+		mz_zip_reader_extract_to_file(zip->zip, zip->index, dest, 0);
 	}
 	
 	sqlite3_free(dest);
 	return 0;
 }
 
-int
-move_rar(char *src, char *dest_dir, char *dest_file, void *rar, int mode)
+
+int CALLBACK
+rar_extract_to_mem(unsigned int msg, long user, long p1, long p2)
 {
-	char	*dest = sqlite3_mprintf("%s/%s", dest_dir, dest_file);
+	switch (msg) {
+	case UCM_CHANGEVOLUME:
+		switch (p2) {
+		case RAR_VOL_ASK:
+			fprintf(stderr, "Next volume in archive (%s) is missing.\n", (char *)p1);
+			return -1;
+		case RAR_VOL_NOTIFY:
+			return 1;
+		}
+		break;
+	case UCM_PROCESSDATA:
+		memcpy(*(char **)user, (char *)p1, p2);
+		*(char **)user += p2;
+		return 1;
+		break;
+	case UCM_NEEDPASSWORD:
+		fprintf(stderr, "Passworded rars aren't supported yet.\n");
+		return -1;
+	}
+}
+
+int
+move_rar(char *src, char *dest_dir, char *dest_file, void *ri, int mode)
+{
+	struct rarinfo	*rar = (struct rarinfo *)ri;
+	char		*dest;
 
 	if (mode & ONLY_DELETE) {
 	} else if (mode & ZIP) {
+		dest = sqlite3_mprintf("%s.zip", dest_dir);
+		char *buffer = (char *)malloc(rar->hdr->UnpSize);
+		char *bptr = buffer;
+
 		make_dirtree(dest_dir, 0);
-		struct zip	*zip;
-		if ((zip = open_zip(dest_dir, 1)) != NULL) {
-			char tmp[32] = "/tmp/filesetXXXXXX";
-			mkstemp(tmp);
-			RARProcessFile(rar, RAR_EXTRACT, NULL, tmp);
-			struct zip_source *s = zip_source_file(zip, tmp, 0, 0);
-			if (zip_add(zip, dest_file, s) == -1) {
-				fprintf(stderr, "zip error: %s\n", zip_strerror(zip));
-			}
-			zip_close(zip);
-			unlink(tmp);
+		RARSetCallback(rar->rar, rar_extract_to_mem, (long)&bptr);
+		RARProcessFile(rar->rar, RAR_EXTRACT, NULL, NULL);
+		if (!mz_zip_add_mem_to_archive_file_in_place(dest, dest_file, buffer, rar->hdr->UnpSize, NULL, 0, MZ_NO_COMPRESSION)) {
+			fprintf(stderr, "error: mz_zip_add_mem_to_archive_file_in_place failed, %d\n");
+			return -1;
 		}
+		free(buffer);
 	} else {
+		dest = sqlite3_mprintf("%s/%s", dest_dir, dest_file);
 		make_dirtree(dest, 0);
 		RARProcessFile(rar, RAR_EXTRACT, NULL, dest);
 	}
@@ -280,7 +315,7 @@ archive_file(sqlite3 *db, char *src, int id, int (*mover)(char *, char *, char *
 	int nrows, ncols;
 
 	query = sqlite3_mprintf("SELECT RTRIM(c.root, '/ ') || '/' || TRIM(c.name, '/ '), "
-				  "RTRIM(s.name, '/ ') || '/' || f.name, "
+				  "TRIM(s.name || '/' || f.name, '/ '), "
 				  "f.found "
 				"FROM collections c, sets s, files f "
 				"WHERE c.id = s.collection_id "
@@ -294,7 +329,7 @@ archive_file(sqlite3 *db, char *src, int id, int (*mover)(char *, char *, char *
 		return NULL;
 	}
 	if (nrows == 1) {
-		mover(src, table[3], table[4], user, mode | ((table[5][0]=='1')?ONLY_DELETE:0));
+		mover(src, table[3], table[4], user, mode);// | ((table[5][0]=='1')?ONLY_DELETE:0));
 		dest = sqlite3_mprintf("%s/%s", table[3], table[4]);
 		SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
 	} else if (nrows > 1) {
@@ -340,33 +375,32 @@ verify_file(sqlite3 *db, char *path, struct stat sb, int mode)
 	return 1;
 }
 
+
 int
-verify_zip(sqlite3 *db, char *path, struct zip *ziparc, int mode)
+verify_zip(sqlite3 *db, char *path, mz_zip_archive *ziparc, int mode)
 {
 	int i;
 	int count = 0;
 	int id;
 
-	for (i = 0; i < zip_get_num_files(ziparc); i++) {
-		struct zip_file *zfile = zip_fopen_index(ziparc,i, 0);
-		struct zip_stat zsb;
-		zip_stat_index(ziparc, i, 0, &zsb);
-		if (zsb.size == 0 && zsb.crc == 0 
-		    && zsb.name[strlen(zsb.name)-1] == '/') {
-			zip_fclose(zfile);
+	for (i = 0; i < mz_zip_reader_get_num_files(ziparc); i++) {
+		if (mz_zip_reader_is_file_a_directory(ziparc, i)) {
 			continue;
 		}
 		count++;
-		id = find_by_crc(db, zsb.size, zsb.crc);
+		mz_zip_archive_file_stat zsb;
+		mz_zip_reader_file_stat(ziparc, i, &zsb);
+		id = find_by_crc(db, zsb.m_uncomp_size, zsb.m_crc32);
 		if (mode & HUNT && id > 0) {
-			struct zipinfo zi = {ziparc, zfile, i};
+			struct zipinfo zi = {ziparc, &zsb, i};
 			char *dest = archive_file(db, path, id, &move_zip, &zi, mode);
 			fprintf(stderr, "Move %s to %s\n", path, dest);
 			sqlite3_free(dest);
 		}
-		zip_fclose(zfile);
 		if (mode & VERBOSE) {
-			fprintf(stdout, "ZFile: %s/%s\t%s\n", path, zip_get_name(ziparc, i, 0), id>0?"Found":"Unknown");
+			char buf[MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE];
+			mz_zip_reader_get_filename(ziparc, i, buf, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE);
+			fprintf(stdout, "ZFile: %s/%s\t%s\n", path, buf, id>0?"Found":"Unknown");
 		}
 	}
 
@@ -395,7 +429,8 @@ verify_rar(sqlite3 *db, char *path, HANDLE *rararc, int mode)
 		if (mode & SEARCH || mode & VERIFY || mode & COUNT) {
 			RARProcessFile(rararc, RAR_SKIP, NULL, NULL);
 		} else if (mode & HUNT && id > 0) {
-			char *dest = archive_file(db, path, id, &move_rar, rararc, mode);
+			struct rarinfo ri = {rararc, &hdr};
+			char *dest = archive_file(db, path, id, &move_rar, &ri, mode);
 			fprintf(stderr, "Move %s to %s\n", path, dest);
 			sqlite3_free(dest);
 		}
@@ -460,7 +495,7 @@ find(sqlite3 *db, char *path, int mode)
 	DIR		*dir;
 	struct dirent	*ent;
 	struct stat	sb;
-	struct zip	*ziparc;
+	mz_zip_archive	*ziparc;
 	HANDLE		rararc;
 	int		pathlen = strlen(path);
 	int		i, j;
@@ -495,11 +530,11 @@ find(sqlite3 *db, char *path, int mode)
 				}
 			} else if ((ziparc = open_zip(fname, 0)) != NULL) {
 				if (mode & COUNT) {
-					count += zip_get_num_files(ziparc);
+					count += zip_get_num_entries(ziparc, 0);
 				} else {
 					count += verify_zip(db, fname, ziparc, mode);
 				}
-				zip_close(ziparc);
+				mz_zip_reader_end(ziparc);
 			} else if ((rararc = rar_open(fname, mode & HUNT)) != NULL) {
 				if (mode & COUNT) {
 					count += rar_get_num_files(rararc);
@@ -521,11 +556,11 @@ find(sqlite3 *db, char *path, int mode)
 		closedir(dir);
 	} else if ((ziparc = open_zip(path, 0)) != NULL) {
 		if (mode & COUNT) {
-			count += zip_get_num_files(ziparc);
+			count += zip_get_num_entries(ziparc, 0);
 		} else {
 			count += verify_zip(db, path, ziparc, mode);
 		}
-		zip_close(ziparc);
+		mz_zip_reader_end(ziparc);
 	} else if ((rararc = rar_open(path, mode & HUNT)) != NULL) {
 		if (mode & COUNT) {
 			count += rar_get_num_files(rararc);
