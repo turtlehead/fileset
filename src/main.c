@@ -135,7 +135,7 @@ find_by_crc(sqlite3 *db, off_t size, unsigned int crc)
 }
 
 int
-make_dirtree(char *path)
+make_dirtree(char *path, int make_leaf)
 {
 	char *ptr = path;
 	while ((ptr = strchr(ptr+1, '/')) != NULL) {
@@ -144,6 +144,9 @@ make_dirtree(char *path)
 			return -1;
 		}
 		*ptr = '/';
+	}
+	if (make_leaf) {
+		return mkdir(path, S_IRWXU | S_IRWXG | S_IRWXO);
 	}
 
 	return 0;
@@ -159,7 +162,7 @@ move_file(char *src, char *dest_dir, char *dest_file, void *user, int mode)
 			unlink(src);
 		}
 	} else if (mode & ZIP) {
-		make_dirtree(dest_dir);
+		make_dirtree(dest_dir, 0);
 		struct zip	*zip;
 		if ((zip = open_zip(dest_dir, 1)) != NULL) {
 			struct zip_source *s = zip_source_file(zip, src, 0, 0);
@@ -172,7 +175,7 @@ move_file(char *src, char *dest_dir, char *dest_file, void *user, int mode)
 			unlink(src);
 		}
 	} else {
-		make_dirtree(dest);
+		make_dirtree(dest, 0);
 		if (!(mode & DELETE) || (rename(src, dest) == -1 && errno == EXDEV)) {
 			int in, out;
 			struct stat sb;
@@ -211,7 +214,7 @@ move_zip(char *src, char *dest_dir, char *dest_file, void *zi, int mode)
 
 	if (mode & ONLY_DELETE) {
 	} else if (mode & ZIP) {
-		make_dirtree(dest_dir);
+		make_dirtree(dest_dir, 0);
 		struct zip	*zip;
 		if ((zip = open_zip(dest_dir, 1)) != NULL) {
 			struct zip_source *s = zip_source_zip(zip, zinfo->zarc, zinfo->index, 0, 0, 0);
@@ -221,7 +224,7 @@ move_zip(char *src, char *dest_dir, char *dest_file, void *zi, int mode)
 			zip_close(zip);
 		}
 	} else {
-		make_dirtree(dest);
+		make_dirtree(dest, 0);
 		int out;
 		if ((out = open(dest, O_RDWR | O_CREAT | O_TRUNC, S_IRWXU | S_IRWXG | S_IRWXO)) == -1) {
 			return -1;
@@ -245,7 +248,7 @@ move_rar(char *src, char *dest_dir, char *dest_file, void *rar, int mode)
 
 	if (mode & ONLY_DELETE) {
 	} else if (mode & ZIP) {
-		make_dirtree(dest_dir);
+		make_dirtree(dest_dir, 0);
 		struct zip	*zip;
 		if ((zip = open_zip(dest_dir, 1)) != NULL) {
 			char tmp[32] = "/tmp/filesetXXXXXX";
@@ -259,7 +262,7 @@ move_rar(char *src, char *dest_dir, char *dest_file, void *rar, int mode)
 			unlink(tmp);
 		}
 	} else {
-		make_dirtree(dest);
+		make_dirtree(dest, 0);
 		RARProcessFile(rar, RAR_EXTRACT, NULL, dest);
 	}
 	
@@ -323,13 +326,13 @@ verify_file(sqlite3 *db, char *path, struct stat sb, int mode)
 	munmap(buffer, sb.st_size);
 	close(in);
 	unsigned int ihash = (hash[3] << 24) + (hash[2] << 16) + (hash[1] << 8) + hash[0];
-	if ((id = find_by_crc(db, sb.st_size, ihash)) > 0) {
-		SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
-	}
 	if (mode & HUNT && id > 0) {
 		char *dest = archive_file(db, path, id, &move_file, NULL, mode);
 		fprintf(stderr, "Move %s to %s\n", path, dest);
 		sqlite3_free(dest);
+	}
+	if ((id = find_by_crc(db, sb.st_size, ihash)) > 0) {
+		SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
 	}
 	if (mode & VERBOSE) {
 		fprintf(stdout, "File: %s\t%s\n", path, id>0?"Found":"Unknown");
@@ -355,9 +358,6 @@ verify_zip(sqlite3 *db, char *path, struct zip *ziparc, int mode)
 			continue;
 		}
 		count++;
-		if ((id = find_by_crc(db, zsb.size, zsb.crc)) > 0) {
-			SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
-		}
 		if (mode & HUNT) {
 			struct zipinfo zi = {ziparc, zfile, i};
 			char *dest = archive_file(db, path, id, &move_zip, &zi, mode);
@@ -365,6 +365,9 @@ verify_zip(sqlite3 *db, char *path, struct zip *ziparc, int mode)
 			sqlite3_free(dest);
 		}
 		zip_fclose(zfile);
+		if ((id = find_by_crc(db, zsb.size, zsb.crc)) > 0) {
+			SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
+		}
 		if (mode & VERBOSE) {
 			fprintf(stdout, "ZFile: %s/%s\t%s\n", path, zip_get_name(ziparc, i, 0), id>0?"Found":"Unknown");
 		}
@@ -391,15 +394,15 @@ verify_rar(sqlite3 *db, char *path, HANDLE *rararc, int mode)
 			continue;
 		}
 		count++;
-		if ((id = find_by_crc(db, hdr.UnpSize, hdr.FileCRC)) > 0) {
-			SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
-		}
 		if (mode & SEARCH || mode & VERIFY || mode & COUNT) {
 			RARProcessFile(rararc, RAR_SKIP, NULL, NULL);
 		} else if (mode & HUNT) {
 			char *dest = archive_file(db, path, id, &move_rar, rararc, mode);
 			fprintf(stderr, "Move %s to %s\n", path, dest);
 			sqlite3_free(dest);
+		}
+		if ((id = find_by_crc(db, hdr.UnpSize, hdr.FileCRC)) > 0) {
+			SQL_UPDATE(db, "UPDATE files SET found=1 WHERE id=%d", id);
 		}
 		if (mode & VERBOSE) {
 			fprintf(stdout, "RFile: %s/%s\t%s\n", path, hdr.FileName, id>0?"Found":"Unknown");
@@ -410,13 +413,17 @@ verify_rar(sqlite3 *db, char *path, HANDLE *rararc, int mode)
 }
 
 HANDLE
-rar_open(char *path)
+rar_open(char *path, int extract)
 {
 	HANDLE arc;
 	struct RAROpenArchiveDataEx in = {0};
 
 	in.ArcName = path;
-	in.OpenMode = RAR_OM_EXTRACT;
+	if (extract) {
+		in.OpenMode = RAR_OM_EXTRACT;
+	} else {
+		in.OpenMode = RAR_OM_LIST;
+	}
 
 	if ((arc = RAROpenArchiveEx(&in)) == NULL) {
 		char *rpath = sqlite3_mprintf("%s.rar", path);
@@ -498,7 +505,7 @@ find(sqlite3 *db, char *path, int mode)
 					count += verify_zip(db, fname, ziparc, mode);
 				}
 				zip_close(ziparc);
-			} else if ((rararc = rar_open(fname)) != NULL) {
+			} else if ((rararc = rar_open(fname, mode & HUNT)) != NULL) {
 				if (mode & COUNT) {
 					count += rar_get_num_files(rararc);
 				} else {
@@ -524,7 +531,7 @@ find(sqlite3 *db, char *path, int mode)
 			count += verify_zip(db, path, ziparc, mode);
 		}
 		zip_close(ziparc);
-	} else if ((rararc = rar_open(path)) != NULL) {
+	} else if ((rararc = rar_open(path, mode & HUNT)) != NULL) {
 		if (mode & COUNT) {
 			count += rar_get_num_files(rararc);
 		} else {
@@ -560,7 +567,8 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 	if (dot) {
 		*dot = '\0';
 	}
-	SQL_INSERT(db, "INSERT INTO collections (name, root) VALUES (%Q, %Q)", strrchr(in_file, '/')+1, root);
+	char *fname = strrchr(in_file, '/');
+	SQL_INSERT(db, "INSERT INTO collections (name, root) VALUES (%Q, %Q)", fname == NULL ? in_file : fname+1, root);
 	collection_id = sqlite3_last_insert_rowid(db);
 
 	char line[2048];
@@ -569,7 +577,8 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 		char *values = NULL, *tok;
 		char *query;
 
-		char *name = strtok(line, "\"");
+		// need to filter out lone \ chars
+		char *name = strtok(line, "\",");
 		if (!strcmp(name, "\\") || name[0] == '\0') {
 			strappend(&values, "/");
 		} else {
@@ -594,7 +603,7 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 			}
 			vcount++;
 		}
-		if (vcount == 5) {
+		if (vcount == 4) {
 			SQL_INSERT(db, "INSERT INTO files (set_id, name, size, crc, comment) VALUES (%d, %s)", set_id, values);
 		} else {
 			SQL_INSERT(db, "INSERT INTO files (set_id, name, size, crc) VALUES (%d, %s)", set_id, values);
@@ -770,20 +779,49 @@ main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	if (dat_flag == CSV) {
-		if (load_csv(crcname, root, db) == EXIT_FAILURE)
-			return EXIT_FAILURE;
-	} else if (dat_flag == CMPRO) {
-		char *actual_root = realpath(root, NULL);
-		if (actual_root) {
-			if (load_cmpro_dat(crcname, actual_root, db) == EXIT_FAILURE)
-				return EXIT_FAILURE;
-			free(actual_root);
-		}
-	}
-
 	if (!argv[optind]) {
 		return EXIT_SUCCESS;
+	} else if (!strcmp(argv[optind], "add")) {
+		HANDLE *rararc = NULL;
+		char *actual_root = realpath(root, NULL);
+		if (actual_root == NULL && errno == ENOENT) {
+			make_dirtree(root, 1);
+			actual_root = realpath(root, NULL);
+		} else {
+			fprintf(stderr, "error: couldn't determine actual root path\n");
+			return EXIT_FAILURE;
+		}
+		if ((rararc = rar_open(crcname, 1)) != NULL) {
+			for (;;) {
+				struct RARHeaderDataEx hdr = {0};
+				int retval;
+				if ((retval = RARReadHeaderEx(rararc, &hdr)) != 0) {
+					break;
+				}
+				if ((hdr.Flags & 0xe0) == 0xe0) {
+					continue;
+				}
+				RARProcessFile(rararc, RAR_EXTRACT, NULL, hdr.FileName);
+
+				if (dat_flag == CSV) {
+					if (load_csv(hdr.FileName, actual_root, db) == EXIT_FAILURE)
+					return EXIT_FAILURE;
+				} else if (dat_flag == CMPRO) {
+					if (load_cmpro_dat(hdr.FileName, actual_root, db) == EXIT_FAILURE)
+					return EXIT_FAILURE;
+				}
+			}
+			rar_close(rararc);
+		} else {
+			if (dat_flag == CSV) {
+				if (load_csv(crcname, actual_root, db) == EXIT_FAILURE)
+					return EXIT_FAILURE;
+			} else if (dat_flag == CMPRO) {
+				if (load_cmpro_dat(crcname, actual_root, db) == EXIT_FAILURE)
+					return EXIT_FAILURE;
+			}
+		}
+		free(actual_root);
 	} else if (!strcmp(argv[optind], "search")) {
 		fprintf(stdout, "Searching %d files\n", find(db, ".", COUNT));
 		fprintf(stdout, "\r%d files searched\n", find(db, ".", SEARCH | find_flags));
