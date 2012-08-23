@@ -18,13 +18,13 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 		return -1;
 	}
 
-	const char *prep_stmt, *tail;
+	const char *prep_stmt;
 	sqlite3_stmt *set_stmt, *file_stmt;
 	prep_stmt = sqlite3_mprintf("INSERT INTO sets (collection_id, name) VALUES (@CID, @NM)");
-	sqlite3_prepare_v2(db, prep_stmt, strlen(prep_stmt), &set_stmt, &tail);
+	sqlite3_prepare_v2(db, prep_stmt, -1, &set_stmt, NULL);
 	sqlite3_free((char *)prep_stmt);
 	prep_stmt = sqlite3_mprintf("INSERT INTO files (set_id, name, size, crc, comment) VALUES (@SID, @NM, @SZ, @CRC, @COM)");
-	sqlite3_prepare_v2(db, prep_stmt, strlen(prep_stmt), &file_stmt, &tail);
+	sqlite3_prepare_v2(db, prep_stmt, -1, &file_stmt, NULL);
 	sqlite3_free((char *)prep_stmt);
 
 	sqlite3_exec(db, "BEGIN TRANSACTION", NULL, NULL, &errmsg);
@@ -48,8 +48,9 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 			int merged = 0;
 			if (vcount > 0) {
 				int lastchar = strlen(field[vcount-1])-1;
-				if ((field[vcount-1][lastchar] == '\\') || // handle str\,str
+				if ((field[vcount-1][lastchar] == '\\' && field[vcount-1][0] != '\\') || // handle str\,str
 				    (field[vcount-1][0] == '"' && field[vcount-1][lastchar] != '"') || // handle "str,str"
+				    (field[vcount-1][0] == '\\' && field[vcount-1][lastchar] != '\\') || /* handle \str,str\*/
 				    (field[vcount-1][0] == '\'' && field[vcount-1][lastchar] != '\'')) { // handle 'str,str'
 					*--tok = ',';
 					merged = 1;
@@ -63,7 +64,7 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 		int i;
 		for (i = 0; i < vcount; i++) {
 			int lastchar = strlen(field[i])-1;
-			if (field[i][0] == field[i][lastchar] && (field[i][0] == '\'' || field[i][0] == '"')) {
+			if (field[i][0] == field[i][lastchar] && (field[i][0] == '\'' || field[i][0] == '"' || field[i][0] == '\\')) {
 				field[i][lastchar] = '\0';
 				field[i]++;
 			}
@@ -85,6 +86,7 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 			}
 			sqlite3_step(set_stmt);
 			set_id = sqlite3_last_insert_rowid(db);
+			sqlite3_reset(set_stmt);
 		}
 
 		sqlite3_bind_int(file_stmt, 1, set_id);
@@ -97,6 +99,7 @@ load_csv(char *in_file, char *root, sqlite3 *db)
 			sqlite3_bind_null(file_stmt, 5);
 		}
 		sqlite3_step(file_stmt);
+		sqlite3_reset(file_stmt);
 
 		continue;
 	}
