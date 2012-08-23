@@ -123,7 +123,7 @@ move_rar(char *src, char *dest_dir, char *dest_file, void *ri, int mode)
 	} else {
 		dest = sqlite3_mprintf("%s/%s", dest_dir, dest_file);
 		make_dirtree(dest, 0);
-		RARProcessFile(rar, RAR_EXTRACT, NULL, dest);
+		RARProcessFile(rar->rar, RAR_EXTRACT, NULL, dest);
 	}
 	
 	sqlite3_free(dest);
