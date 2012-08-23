@@ -63,6 +63,12 @@
 
 #define SQL_UPDATE(db, ...) SQL_INSERT(db, __VA_ARGS__)
 
+struct fileinfo {
+	char	*buffer;
+	off_t	bufsiz;
+	mode_t	mode;
+};
+
 struct zipinfo {
 	mz_zip_archive			*zip;
 	mz_zip_archive_file_stat	*stat;

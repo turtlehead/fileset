@@ -12,12 +12,10 @@
 #include "fileset.h"
 
 int
-move_file(char *src, char *dest_dir, char *dest_file, void *user, int mode)
+move_file(char *src, char *dest_dir, char *dest_file, void *fi, int mode)
 {
-	char	*dest;
-
-	int in;
-	struct stat sb;
+	struct fileinfo	*in = (struct fileinfo *)fi;
+	char		*dest;
 
 	if (mode & ONLY_DELETE) {
 		if (mode & DELETE) {
@@ -26,46 +24,36 @@ move_file(char *src, char *dest_dir, char *dest_file, void *user, int mode)
 		return 0;
 	}
 
-	if ((in = open(src, O_RDONLY)) == -1) {
-		return -1;
-	}
-	stat(src, &sb);
 	if (mode & ZIP) {
 		dest = sqlite3_mprintf("%s.zip", dest_dir);
-		char *buffer = (char *)malloc(sb.st_size);
-		int count = 0;
 
 		make_dirtree(dest_dir, 0);
-		while ((count += read(in, buffer+count, sb.st_size-count)) < sb.st_size);
-		if (!mz_zip_add_mem_to_archive_file_in_place(dest, dest_file, buffer, sb.st_size, NULL, 0, MZ_NO_COMPRESSION)) {
+		if (!mz_zip_add_mem_to_archive_file_in_place(dest, dest_file, in->buffer, in->bufsiz, NULL, 0, MZ_NO_COMPRESSION)) {
 			fprintf(stderr, "error: mz_zip_add_mem_to_archive_file_in_place failed, %d\n");
 			return -1;
 		}
-		free(buffer);
 	} else {
 		dest =  sqlite3_mprintf("%s/%s", dest_dir, dest_file);
 		make_dirtree(dest, 0);
 		if (!(mode & DELETE) || (rename(src, dest) == -1 && errno == EXDEV)) {
 			int out;
-			if ((out = open(dest, O_RDWR | O_CREAT | O_TRUNC, sb.st_mode)) == -1) {
+			if ((out = open(dest, O_RDWR | O_CREAT | O_TRUNC, in->mode)) == -1) {
 				return -1;
 			}
-			pwrite(out, "", 1, sb.st_size - 1);
-			unsigned char *srcbuf, *destbuf;
-			srcbuf = (unsigned char *)mmap(NULL, sb.st_size, PROT_READ, MAP_SHARED, in, 0);
-			destbuf = (unsigned char *)mmap(NULL, sb.st_size, PROT_WRITE, MAP_SHARED, out, 0);
-			memcpy(destbuf, srcbuf, sb.st_size);
-			munmap(srcbuf, sb.st_size);
-			munmap(destbuf, sb.st_size);
+			pwrite(out, "", 1, in->bufsiz - 1);
+			unsigned char *destbuf;
+			destbuf = (unsigned char *)mmap(NULL, in->bufsiz, PROT_WRITE, MAP_SHARED, out, 0);
+			memcpy(destbuf, in->buffer, in->bufsiz);
+			munmap(destbuf, in->bufsiz);
 			close(out);
 		}
 	}
 	
-	close(in);
 	if (mode & DELETE) {
 		unlink(src);
 	}
 	sqlite3_free(dest);
+
 	return 0;
 }
 
@@ -184,15 +172,16 @@ verify_file(sqlite3 *db, char *path, struct stat sb, int mode)
 	buffer = (unsigned char *)mmap(NULL, sb.st_size, PROT_READ, MAP_SHARED, in, 0);
 	mhash(td, buffer, sb.st_size);
 	mhash_deinit(td, hash);
-	munmap(buffer, sb.st_size);
-	close(in);
 	unsigned int ihash = (hash[3] << 24) + (hash[2] << 16) + (hash[1] << 8) + hash[0];
 	id = find_by_crc(db, sb.st_size, ihash);
 	if (mode & HUNT && id > 0) {
-		char *dest = archive_file(db, path, id, &move_file, NULL, mode);
+		struct fileinfo fi = {buffer, sb.st_size, sb.st_mode};
+		char *dest = archive_file(db, path, id, &move_file, &fi, mode);
 		fprintf(stderr, "Move %s to %s\n", path, dest);
 		sqlite3_free(dest);
 	}
+	munmap(buffer, sb.st_size);
+	close(in);
 	if (mode & VERBOSE) {
 		fprintf(stdout, "File: %s\t%s\n", path, id>0?"Found":"Unknown");
 	}
